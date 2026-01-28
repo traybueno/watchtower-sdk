@@ -6,7 +6,7 @@
  * ```ts
  * import { Watchtower } from '@watchtower/sdk'
  * 
- * const wt = new Watchtower({ gameId: 'my-game' })
+ * const wt = new Watchtower({ gameId: 'my-game', apiKey: 'wt_...' })
  * 
  * // Cloud saves
  * await wt.save('progress', { level: 5, coins: 100 })
@@ -16,9 +16,25 @@
  * const room = await wt.createRoom()
  * console.log('Room code:', room.code) // e.g., "ABCD"
  * 
- * room.on('playerJoined', (playerId) => { ... })
- * room.on('message', (from, data) => { ... })
- * room.broadcast({ x: 100, y: 200 })
+ * // Player state (auto-synced to others)
+ * room.player.set({ x: 100, y: 200, sprite: 'idle' })
+ * 
+ * // See other players
+ * room.on('players', (players) => {
+ *   for (const [id, state] of Object.entries(players)) {
+ *     updatePlayer(id, state)
+ *   }
+ * })
+ * 
+ * // Shared game state (host-controlled)
+ * if (room.isHost) {
+ *   room.state.set({ phase: 'playing', round: 1 })
+ * }
+ * room.on('state', (state) => updateGameState(state))
+ * 
+ * // One-off events
+ * room.broadcast({ type: 'explosion', x: 50, y: 50 })
+ * room.on('message', (from, data) => handleEvent(from, data))
  * ```
  */
 
@@ -40,21 +56,152 @@ export interface SaveData<T = unknown> {
   data: T
 }
 
+export interface PlayerInfo {
+  id: string
+  joinedAt: number
+}
+
 export interface RoomInfo {
   code: string
   gameId: string
   hostId: string
-  players: { id: string; joinedAt: number }[]
+  players: PlayerInfo[]
   playerCount: number
 }
 
+/** Player state - position, animation, custom data */
+export type PlayerState = Record<string, unknown>
+
+/** All players' states indexed by player ID */
+export type PlayersState = Record<string, PlayerState>
+
+/** Shared game state - host controlled */
+export type GameState = Record<string, unknown>
+
 export type RoomEventMap = {
+  /** Fired when connected to room */
   connected: (info: { playerId: string; room: RoomInfo }) => void
+  /** Fired when a player joins */
   playerJoined: (playerId: string, playerCount: number) => void
+  /** Fired when a player leaves */
   playerLeft: (playerId: string, playerCount: number) => void
+  /** Fired when players' states update (includes all players) */
+  players: (players: PlayersState) => void
+  /** Fired when shared game state updates */
+  state: (state: GameState) => void
+  /** Fired when host changes */
+  hostChanged: (newHostId: string) => void
+  /** Fired when receiving a broadcast message */
   message: (from: string, data: unknown) => void
+  /** Fired on disconnect */
   disconnected: () => void
+  /** Fired on error */
   error: (error: Error) => void
+}
+
+// ============ PLAYER STATE MANAGER ============
+
+class PlayerStateManager {
+  private room: Room
+  private _state: PlayerState = {}
+  private syncInterval: ReturnType<typeof setInterval> | null = null
+  private dirty = false
+  private syncRateMs: number
+
+  constructor(room: Room, syncRateMs = 50) { // 20Hz default
+    this.room = room
+    this.syncRateMs = syncRateMs
+  }
+
+  /** Set player state (merged with existing) */
+  set(state: PlayerState): void {
+    this._state = { ...this._state, ...state }
+    this.dirty = true
+  }
+
+  /** Replace entire player state */
+  replace(state: PlayerState): void {
+    this._state = state
+    this.dirty = true
+  }
+
+  /** Get current player state */
+  get(): PlayerState {
+    return { ...this._state }
+  }
+
+  /** Clear player state */
+  clear(): void {
+    this._state = {}
+    this.dirty = true
+  }
+
+  /** Start automatic sync */
+  startSync(): void {
+    if (this.syncInterval) return
+    
+    this.syncInterval = setInterval(() => {
+      if (this.dirty) {
+        this.room['send']({ type: 'player_state', state: this._state })
+        this.dirty = false
+      }
+    }, this.syncRateMs)
+  }
+
+  /** Stop automatic sync */
+  stopSync(): void {
+    if (this.syncInterval) {
+      clearInterval(this.syncInterval)
+      this.syncInterval = null
+    }
+  }
+
+  /** Force immediate sync */
+  sync(): void {
+    this.room['send']({ type: 'player_state', state: this._state })
+    this.dirty = false
+  }
+}
+
+// ============ GAME STATE MANAGER ============
+
+class GameStateManager {
+  private room: Room
+  private _state: GameState = {}
+
+  constructor(room: Room) {
+    this.room = room
+  }
+
+  /** Set game state (host only, merged with existing) */
+  set(state: GameState): void {
+    if (!this.room.isHost) {
+      console.warn('Only the host can set game state')
+      return
+    }
+    this._state = { ...this._state, ...state }
+    this.room['send']({ type: 'game_state', state: this._state })
+  }
+
+  /** Replace entire game state (host only) */
+  replace(state: GameState): void {
+    if (!this.room.isHost) {
+      console.warn('Only the host can set game state')
+      return
+    }
+    this._state = state
+    this.room['send']({ type: 'game_state', state: this._state })
+  }
+
+  /** Get current game state */
+  get(): GameState {
+    return { ...this._state }
+  }
+
+  /** Update internal state (called on sync from server) */
+  _update(state: GameState): void {
+    this._state = state
+  }
 }
 
 // ============ ROOM CLASS ============
@@ -64,10 +211,52 @@ export class Room {
   private ws: WebSocket | null = null
   private listeners: Map<string, Set<Function>> = new Map()
   private config: Required<WatchtowerConfig>
+  
+  /** Player state manager - set your position/state here */
+  readonly player: PlayerStateManager
+  
+  /** Game state manager - shared state (host-controlled) */
+  readonly state: GameStateManager
+  
+  /** All players' current states */
+  private _players: PlayersState = {}
+  
+  /** Current host ID */
+  private _hostId: string = ''
+  
+  /** Room info from initial connection */
+  private _roomInfo: RoomInfo | null = null
 
   constructor(code: string, config: Required<WatchtowerConfig>) {
     this.code = code
     this.config = config
+    this.player = new PlayerStateManager(this)
+    this.state = new GameStateManager(this)
+  }
+
+  /** Get the current host ID */
+  get hostId(): string {
+    return this._hostId
+  }
+
+  /** Check if current player is the host */
+  get isHost(): boolean {
+    return this._hostId === this.config.playerId
+  }
+
+  /** Get current player's ID */
+  get playerId(): string {
+    return this.config.playerId
+  }
+
+  /** Get all players' states */
+  get players(): PlayersState {
+    return { ...this._players }
+  }
+
+  /** Get player count */
+  get playerCount(): number {
+    return Object.keys(this._players).length
   }
 
   /** Connect to the room via WebSocket */
@@ -82,16 +271,19 @@ export class Room {
       this.ws = new WebSocket(url)
 
       this.ws.onopen = () => {
+        // Start player state sync after connection
+        this.player.startSync()
         resolve()
       }
 
-      this.ws.onerror = (event) => {
+      this.ws.onerror = () => {
         const error = new Error('WebSocket connection failed')
         this.emit('error', error)
         reject(error)
       }
 
       this.ws.onclose = () => {
+        this.player.stopSync()
         this.emit('disconnected')
       }
 
@@ -109,6 +301,16 @@ export class Room {
   private handleMessage(data: any) {
     switch (data.type) {
       case 'connected':
+        this._hostId = data.room.hostId
+        this._roomInfo = data.room
+        // Initialize players state
+        if (data.playerStates) {
+          this._players = data.playerStates
+        }
+        // Initialize game state
+        if (data.gameState) {
+          this.state._update(data.gameState)
+        }
         this.emit('connected', {
           playerId: data.playerId,
           room: data.room
@@ -120,11 +322,41 @@ export class Room {
         break
 
       case 'player_left':
+        // Remove player from local state
+        delete this._players[data.playerId]
         this.emit('playerLeft', data.playerId, data.playerCount)
+        this.emit('players', this._players)
+        break
+
+      case 'players_sync':
+        // Full sync of all player states
+        this._players = data.players
+        this.emit('players', this._players)
+        break
+
+      case 'player_state_update':
+        // Single player state update
+        this._players[data.playerId] = data.state
+        this.emit('players', this._players)
+        break
+
+      case 'game_state_sync':
+        // Game state update from host
+        this.state._update(data.state)
+        this.emit('state', data.state)
+        break
+
+      case 'host_changed':
+        this._hostId = data.hostId
+        this.emit('hostChanged', data.hostId)
         break
 
       case 'message':
         this.emit('message', data.from, data.data)
+        break
+
+      case 'pong':
+        // Could emit a latency event here
         break
     }
   }
@@ -152,7 +384,7 @@ export class Room {
     })
   }
 
-  /** Broadcast data to all players in the room */
+  /** Broadcast data to all players in the room (for one-off events) */
   broadcast(data: unknown, excludeSelf = true): void {
     this.send({ type: 'broadcast', data, excludeSelf })
   }
@@ -167,6 +399,15 @@ export class Room {
     this.send({ type: 'ping' })
   }
 
+  /** Request host transfer (host only) */
+  transferHost(newHostId: string): void {
+    if (!this.isHost) {
+      console.warn('Only the host can transfer host')
+      return
+    }
+    this.send({ type: 'transfer_host', newHostId })
+  }
+
   private send(data: unknown): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data))
@@ -177,6 +418,7 @@ export class Room {
 
   /** Disconnect from the room */
   disconnect(): void {
+    this.player.stopSync()
     if (this.ws) {
       this.ws.close()
       this.ws = null
@@ -306,7 +548,7 @@ export class Watchtower {
 
   /**
    * Create a new multiplayer room
-   * @returns A Room instance (call .connect() to join)
+   * @returns A Room instance (already connected)
    */
   async createRoom(): Promise<Room> {
     const result = await this.fetch<{ code: string }>('POST', '/v1/rooms')
@@ -318,7 +560,7 @@ export class Watchtower {
   /**
    * Join an existing room by code
    * @param code - The 4-letter room code
-   * @returns A Room instance
+   * @returns A Room instance (already connected)
    */
   async joinRoom(code: string): Promise<Room> {
     code = code.toUpperCase().trim()

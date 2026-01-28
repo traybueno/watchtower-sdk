@@ -1,10 +1,120 @@
 // src/index.ts
+var PlayerStateManager = class {
+  constructor(room, syncRateMs = 50) {
+    this._state = {};
+    this.syncInterval = null;
+    this.dirty = false;
+    this.room = room;
+    this.syncRateMs = syncRateMs;
+  }
+  /** Set player state (merged with existing) */
+  set(state) {
+    this._state = { ...this._state, ...state };
+    this.dirty = true;
+  }
+  /** Replace entire player state */
+  replace(state) {
+    this._state = state;
+    this.dirty = true;
+  }
+  /** Get current player state */
+  get() {
+    return { ...this._state };
+  }
+  /** Clear player state */
+  clear() {
+    this._state = {};
+    this.dirty = true;
+  }
+  /** Start automatic sync */
+  startSync() {
+    if (this.syncInterval) return;
+    this.syncInterval = setInterval(() => {
+      if (this.dirty) {
+        this.room["send"]({ type: "player_state", state: this._state });
+        this.dirty = false;
+      }
+    }, this.syncRateMs);
+  }
+  /** Stop automatic sync */
+  stopSync() {
+    if (this.syncInterval) {
+      clearInterval(this.syncInterval);
+      this.syncInterval = null;
+    }
+  }
+  /** Force immediate sync */
+  sync() {
+    this.room["send"]({ type: "player_state", state: this._state });
+    this.dirty = false;
+  }
+};
+var GameStateManager = class {
+  constructor(room) {
+    this._state = {};
+    this.room = room;
+  }
+  /** Set game state (host only, merged with existing) */
+  set(state) {
+    if (!this.room.isHost) {
+      console.warn("Only the host can set game state");
+      return;
+    }
+    this._state = { ...this._state, ...state };
+    this.room["send"]({ type: "game_state", state: this._state });
+  }
+  /** Replace entire game state (host only) */
+  replace(state) {
+    if (!this.room.isHost) {
+      console.warn("Only the host can set game state");
+      return;
+    }
+    this._state = state;
+    this.room["send"]({ type: "game_state", state: this._state });
+  }
+  /** Get current game state */
+  get() {
+    return { ...this._state };
+  }
+  /** Update internal state (called on sync from server) */
+  _update(state) {
+    this._state = state;
+  }
+};
 var Room = class {
   constructor(code, config) {
     this.ws = null;
     this.listeners = /* @__PURE__ */ new Map();
+    /** All players' current states */
+    this._players = {};
+    /** Current host ID */
+    this._hostId = "";
+    /** Room info from initial connection */
+    this._roomInfo = null;
     this.code = code;
     this.config = config;
+    this.player = new PlayerStateManager(this);
+    this.state = new GameStateManager(this);
+  }
+  /** Get the current host ID */
+  get hostId() {
+    return this._hostId;
+  }
+  /** Check if current player is the host */
+  get isHost() {
+    return this._hostId === this.config.playerId;
+  }
+  /** Get current player's ID */
+  get playerId() {
+    return this.config.playerId;
+  }
+  /** Get all players' states */
+  get players() {
+    return { ...this._players };
+  }
+  /** Get player count */
+  get playerCount() {
+    return Object.keys(this._players).length;
   }
   /** Connect to the room via WebSocket */
   async connect() {
@@ -13,14 +123,16 @@ var Room = class {
       const url = `${wsUrl}/v1/rooms/${this.code}/ws?playerId=${this.config.playerId}`;
       this.ws = new WebSocket(url);
       this.ws.onopen = () => {
+        this.player.startSync();
         resolve();
       };
-      this.ws.onerror = (event) => {
+      this.ws.onerror = () => {
         const error = new Error("WebSocket connection failed");
         this.emit("error", error);
         reject(error);
       };
       this.ws.onclose = () => {
+        this.player.stopSync();
         this.emit("disconnected");
       };
       this.ws.onmessage = (event) => {
@@ -36,6 +148,14 @@ var Room = class {
   handleMessage(data) {
     switch (data.type) {
       case "connected":
+        this._hostId = data.room.hostId;
+        this._roomInfo = data.room;
+        if (data.playerStates) {
+          this._players = data.playerStates;
+        }
+        if (data.gameState) {
+          this.state._update(data.gameState);
+        }
         this.emit("connected", {
           playerId: data.playerId,
           room: data.room
@@ -45,10 +165,30 @@ var Room = class {
         this.emit("playerJoined", data.playerId, data.playerCount);
         break;
       case "player_left":
+        delete this._players[data.playerId];
         this.emit("playerLeft", data.playerId, data.playerCount);
+        this.emit("players", this._players);
+        break;
+      case "players_sync":
+        this._players = data.players;
+        this.emit("players", this._players);
+        break;
+      case "player_state_update":
+        this._players[data.playerId] = data.state;
+        this.emit("players", this._players);
+        break;
+      case "game_state_sync":
+        this.state._update(data.state);
+        this.emit("state", data.state);
+        break;
+      case "host_changed":
+        this._hostId = data.hostId;
+        this.emit("hostChanged", data.hostId);
         break;
       case "message":
         this.emit("message", data.from, data.data);
+        break;
+      case "pong":
         break;
     }
   }
@@ -72,7 +212,7 @@ var Room = class {
       }
     });
   }
-  /** Broadcast data to all players in the room */
+  /** Broadcast data to all players in the room (for one-off events) */
   broadcast(data, excludeSelf = true) {
     this.send({ type: "broadcast", data, excludeSelf });
   }
@@ -84,6 +224,14 @@ var Room = class {
   ping() {
     this.send({ type: "ping" });
   }
+  /** Request host transfer (host only) */
+  transferHost(newHostId) {
+    if (!this.isHost) {
+      console.warn("Only the host can transfer host");
+      return;
+    }
+    this.send({ type: "transfer_host", newHostId });
+  }
   send(data) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
@@ -93,6 +241,7 @@ var Room = class {
   }
   /** Disconnect from the room */
   disconnect() {
+    this.player.stopSync();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -193,7 +342,7 @@ var Watchtower = class {
   // ============ ROOMS API ============
   /**
    * Create a new multiplayer room
-   * @returns A Room instance (call .connect() to join)
+   * @returns A Room instance (already connected)
    */
   async createRoom() {
     const result = await this.fetch("POST", "/v1/rooms");
@@ -204,7 +353,7 @@ var Watchtower = class {
   /**
    * Join an existing room by code
    * @param code - The 4-letter room code
-   * @returns A Room instance
+   * @returns A Room instance (already connected)
    */
   async joinRoom(code) {
     code = code.toUpperCase().trim();
