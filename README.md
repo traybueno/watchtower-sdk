@@ -1,17 +1,17 @@
-# @watchtower/sdk
+# @watchtower-sdk/core
 
 Simple game backend SDK - cloud saves, multiplayer rooms, automatic state sync.
 
 ## Installation
 
 ```bash
-npm install @watchtower/sdk
+npm install @watchtower-sdk/core
 ```
 
 ## Quick Start
 
 ```typescript
-import { Watchtower } from '@watchtower/sdk'
+import { Watchtower } from '@watchtower-sdk/core'
 
 const wt = new Watchtower({
   gameId: 'my-game',
@@ -204,7 +204,7 @@ if (room.isHost) {
 ## Full Example: Simple Multiplayer Game
 
 ```typescript
-import { Watchtower } from '@watchtower/sdk'
+import { Watchtower } from '@watchtower-sdk/core'
 
 const wt = new Watchtower({ gameId: 'my-game', apiKey: 'wt_...' })
 
