@@ -477,6 +477,14 @@ export interface SyncOptions {
   tickRate?: number
   /** Enable interpolation for remote entities (default: true) */
   interpolate?: boolean
+  /** Interpolation delay in ms - how far "in the past" to render others (default: 100) */
+  interpolationDelay?: number
+  /** Jitter buffer size in ms - smooths network variance (default: 50) */
+  jitterBuffer?: number
+  /** Enable auto-reconnection on disconnect (default: true) */
+  autoReconnect?: boolean
+  /** Max reconnection attempts (default: 10) */
+  maxReconnectAttempts?: number
 }
 
 export interface JoinOptions {
@@ -545,9 +553,21 @@ export class Sync<T extends Record<string, unknown>> {
   private _roomId: string | null = null
   private ws: WebSocket | null = null
   private syncInterval: ReturnType<typeof setInterval> | null = null
+  private interpolationInterval: ReturnType<typeof setInterval> | null = null
   private lastSentState: string = ''
-  private interpolationTargets: Map<string, { target: Record<string, unknown>, current: Record<string, unknown> }> = new Map()
   private listeners: Map<string, Set<Function>> = new Map()
+  
+  // Snapshot-based interpolation: store timestamped snapshots per player
+  private snapshots: Map<string, Array<{ time: number, state: Record<string, unknown> }>> = new Map()
+  
+  // Jitter buffer: queue incoming updates before applying
+  private jitterQueue: Array<{ deliverAt: number, playerId: string, state: Record<string, unknown> }> = []
+  
+  // Auto-reconnect state
+  private reconnectAttempts: number = 0
+  private reconnectTimeout: ReturnType<typeof setTimeout> | null = null
+  private lastJoinOptions: JoinOptions | undefined = undefined
+  private isReconnecting: boolean = false
 
   constructor(state: T, config: Required<WatchtowerConfig>, options?: SyncOptions) {
     this.state = state
@@ -555,7 +575,11 @@ export class Sync<T extends Record<string, unknown>> {
     this.config = config
     this.options = {
       tickRate: options?.tickRate ?? 20,
-      interpolate: options?.interpolate ?? true
+      interpolate: options?.interpolate ?? true,
+      interpolationDelay: options?.interpolationDelay ?? 100,
+      jitterBuffer: options?.jitterBuffer ?? 0, // 0 = immediate, set to 50+ for smoothing
+      autoReconnect: options?.autoReconnect ?? true,
+      maxReconnectAttempts: options?.maxReconnectAttempts ?? 10
     }
   }
 
@@ -567,24 +591,37 @@ export class Sync<T extends Record<string, unknown>> {
    */
   async join(roomId: string, options?: JoinOptions): Promise<void> {
     // Leave current room if any
-    if (this._roomId) {
+    if (this._roomId && !this.isReconnecting) {
       await this.leave()
     }
 
     this._roomId = roomId
+    this.lastJoinOptions = options
+    this.reconnectAttempts = 0
 
     // Connect WebSocket
     await this.connectWebSocket(roomId, options)
 
     // Start sync loop
     this.startSyncLoop()
+    
+    // Start interpolation loop (60fps for smooth visuals)
+    this.startInterpolationLoop()
   }
 
   /**
    * Leave the current room
    */
   async leave(): Promise<void> {
+    // Cancel any pending reconnect
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout)
+      this.reconnectTimeout = null
+    }
+    this.isReconnecting = false
+    
     this.stopSyncLoop()
+    this.stopInterpolationLoop()
     
     if (this.ws) {
       this.ws.close()
@@ -593,6 +630,10 @@ export class Sync<T extends Record<string, unknown>> {
 
     // Clear other players from state (keep our own data structure)
     this.clearRemotePlayers()
+    
+    // Clear interpolation data
+    this.snapshots.clear()
+    this.jitterQueue = []
     
     this._roomId = null
   }
@@ -641,7 +682,7 @@ export class Sync<T extends Record<string, unknown>> {
   /**
    * Subscribe to sync events
    */
-  on(event: 'join' | 'leave' | 'error' | 'connected' | 'disconnected' | 'message', callback: Function): void {
+  on(event: 'join' | 'leave' | 'error' | 'connected' | 'disconnected' | 'reconnecting' | 'reconnected' | 'message', callback: Function): void {
     if (!this.listeners.has(event)) {
       this.listeners.set(event, new Set())
     }
@@ -706,6 +747,11 @@ export class Sync<T extends Record<string, unknown>> {
       this.ws.onclose = () => {
         this.stopSyncLoop()
         this.emit('disconnected')
+        
+        // Auto-reconnect if enabled and we were in a room
+        if (this.options.autoReconnect && this._roomId && !this.isReconnecting) {
+          this.attemptReconnect()
+        }
       }
 
       this.ws.onmessage = (event) => {
@@ -759,21 +805,57 @@ export class Sync<T extends Record<string, unknown>> {
   }
 
   private applyPlayerState(playerId: string, playerState: Record<string, unknown>) {
-    // Find the 'players' key in state (convention)
-    const playersKey = this.findPlayersKey()
-    if (!playersKey) return
-
-    const players = this.state[playersKey] as Record<string, unknown>
-    
-    if (this.options.interpolate && players[playerId]) {
-      // Set up interpolation target
-      this.interpolationTargets.set(playerId, {
-        target: { ...playerState },
-        current: { ...(players[playerId] as Record<string, unknown>) }
+    if (this.options.interpolate && this.options.jitterBuffer > 0) {
+      // Queue the update for jitter buffering
+      this.jitterQueue.push({
+        deliverAt: Date.now() + this.options.jitterBuffer,
+        playerId,
+        state: { ...playerState }
       })
+    } else if (this.options.interpolate) {
+      // No jitter buffer, but still use snapshots for interpolation
+      this.addSnapshot(playerId, playerState)
+    } else {
+      // No interpolation - apply directly
+      this.applyStateDirect(playerId, playerState)
+    }
+  }
+  
+  private addSnapshot(playerId: string, playerState: Record<string, unknown>) {
+    const isNewPlayer = !this.snapshots.has(playerId)
+    
+    if (isNewPlayer) {
+      this.snapshots.set(playerId, [])
     }
     
-    // Apply state
+    const playerSnapshots = this.snapshots.get(playerId)!
+    playerSnapshots.push({
+      time: Date.now(),
+      state: { ...playerState }
+    })
+    
+    // Keep only last 10 snapshots (500ms at 20Hz)
+    while (playerSnapshots.length > 10) {
+      playerSnapshots.shift()
+    }
+    
+    // Ensure player exists in state
+    const playersKey = this.findPlayersKey()
+    if (playersKey) {
+      const players = this.state[playersKey] as Record<string, unknown>
+      if (isNewPlayer || !players[playerId]) {
+        // New player - apply state immediately (no prior data to interpolate from)
+        players[playerId] = { ...playerState }
+      }
+      // Existing players get updated via updateInterpolation()
+    }
+  }
+  
+  private applyStateDirect(playerId: string, playerState: Record<string, unknown>) {
+    const playersKey = this.findPlayersKey()
+    if (!playersKey) return
+    
+    const players = this.state[playersKey] as Record<string, unknown>
     players[playerId] = playerState
   }
 
@@ -783,7 +865,35 @@ export class Sync<T extends Record<string, unknown>> {
 
     const players = this.state[playersKey] as Record<string, unknown>
     delete players[playerId]
-    this.interpolationTargets.delete(playerId)
+    this.snapshots.delete(playerId)
+  }
+  
+  private attemptReconnect() {
+    if (this.reconnectAttempts >= this.options.maxReconnectAttempts) {
+      this.emit('error', new Error('Max reconnection attempts reached'))
+      return
+    }
+    
+    this.isReconnecting = true
+    this.reconnectAttempts++
+    
+    // Exponential backoff: 1s, 2s, 4s, 8s... max 30s
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts - 1), 30000)
+    
+    this.emit('reconnecting', { attempt: this.reconnectAttempts, delay })
+    
+    this.reconnectTimeout = setTimeout(async () => {
+      try {
+        await this.connectWebSocket(this._roomId!, this.lastJoinOptions)
+        this.startSyncLoop()
+        this.isReconnecting = false
+        this.reconnectAttempts = 0
+        this.emit('reconnected')
+      } catch (e) {
+        // Will trigger onclose which will retry
+        this.isReconnecting = false
+      }
+    }, delay)
   }
 
   private clearRemotePlayers() {
@@ -796,7 +906,8 @@ export class Sync<T extends Record<string, unknown>> {
         delete players[playerId]
       }
     }
-    this.interpolationTargets.clear()
+    this.snapshots.clear()
+    this.jitterQueue = []
   }
 
   private findPlayersKey(): string | null {
@@ -823,10 +934,35 @@ export class Sync<T extends Record<string, unknown>> {
 
     this.syncInterval = setInterval(() => {
       this.syncMyState()
-      if (this.options.interpolate) {
-        this.updateInterpolation()
-      }
     }, intervalMs)
+  }
+  
+  private startInterpolationLoop() {
+    if (this.interpolationInterval) return
+    if (!this.options.interpolate) return
+    
+    // Run at 60fps for smooth visuals
+    this.interpolationInterval = setInterval(() => {
+      this.processJitterQueue()
+      this.updateInterpolation()
+    }, 16) // ~60fps
+  }
+  
+  private stopInterpolationLoop() {
+    if (this.interpolationInterval) {
+      clearInterval(this.interpolationInterval)
+      this.interpolationInterval = null
+    }
+  }
+  
+  private processJitterQueue() {
+    const now = Date.now()
+    const ready = this.jitterQueue.filter(item => item.deliverAt <= now)
+    this.jitterQueue = this.jitterQueue.filter(item => item.deliverAt > now)
+    
+    for (const item of ready) {
+      this.addSnapshot(item.playerId, item.state)
+    }
   }
 
   private stopSyncLoop() {
@@ -864,19 +1000,63 @@ export class Sync<T extends Record<string, unknown>> {
     if (!playersKey) return
 
     const players = this.state[playersKey] as Record<string, Record<string, unknown>>
-    const lerpFactor = 0.2 // Smoothing factor
+    
+    // Render time is "now" minus interpolation delay (we show the past)
+    const renderTime = Date.now() - this.options.interpolationDelay
 
-    for (const [playerId, interp] of this.interpolationTargets) {
+    for (const [playerId, playerSnapshots] of this.snapshots) {
+      if (playerId === this.myId) continue
+      
       const player = players[playerId]
       if (!player) continue
-
-      // Interpolate numeric values
-      for (const [key, targetValue] of Object.entries(interp.target)) {
-        if (typeof targetValue === 'number' && typeof interp.current[key] === 'number') {
-          const current = interp.current[key] as number
-          const newValue = current + (targetValue - current) * lerpFactor
-          interp.current[key] = newValue
-          player[key] = newValue
+      
+      // Find the two snapshots surrounding renderTime
+      let before: { time: number, state: Record<string, unknown> } | null = null
+      let after: { time: number, state: Record<string, unknown> } | null = null
+      
+      for (const snapshot of playerSnapshots) {
+        if (snapshot.time <= renderTime) {
+          before = snapshot
+        } else if (!after) {
+          after = snapshot
+        }
+      }
+      
+      if (before && after) {
+        // Interpolate between the two snapshots
+        const total = after.time - before.time
+        const elapsed = renderTime - before.time
+        const alpha = total > 0 ? Math.min(1, elapsed / total) : 1
+        
+        this.lerpState(player, before.state, after.state, alpha)
+      } else if (before) {
+        // No future snapshot yet - extrapolate slightly or hold
+        // For now, just use the latest known state
+        this.lerpState(player, player, before.state, 0.3)
+      } else if (after) {
+        // Somehow we're behind (shouldn't happen often)
+        this.lerpState(player, player, after.state, 0.3)
+      }
+    }
+  }
+  
+  private lerpState(
+    target: Record<string, unknown>,
+    from: Record<string, unknown>,
+    to: Record<string, unknown>,
+    alpha: number
+  ) {
+    for (const key of Object.keys(to)) {
+      const fromVal = from[key]
+      const toVal = to[key]
+      
+      if (typeof fromVal === 'number' && typeof toVal === 'number') {
+        // Linear interpolation for numbers
+        target[key] = fromVal + (toVal - fromVal) * alpha
+      } else {
+        // Non-numeric: just use target value when alpha > 0.5
+        if (alpha > 0.5) {
+          target[key] = toVal
         }
       }
     }

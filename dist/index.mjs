@@ -307,6 +307,16 @@ var Sync = class {
     this._roomId = null;
   }
   /**
+   * Send a one-off message to all players in the room
+   * 
+   * @param data - Any JSON-serializable data
+   */
+  broadcast(data) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "broadcast", data }));
+    }
+  }
+  /**
    * Create a new room and join it
    * 
    * @param options - Room creation options
@@ -412,6 +422,9 @@ var Sync = class {
       case "leave":
         this.removePlayer(data.playerId);
         this.emit("leave", data.playerId);
+        break;
+      case "message":
+        this.emit("message", data.from, data.data);
         break;
     }
   }

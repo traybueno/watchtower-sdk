@@ -284,6 +284,12 @@ declare class Sync<T extends Record<string, unknown>> {
      */
     leave(): Promise<void>;
     /**
+     * Send a one-off message to all players in the room
+     *
+     * @param data - Any JSON-serializable data
+     */
+    broadcast(data: unknown): void;
+    /**
      * Create a new room and join it
      *
      * @param options - Room creation options
@@ -297,7 +303,7 @@ declare class Sync<T extends Record<string, unknown>> {
     /**
      * Subscribe to sync events
      */
-    on(event: 'join' | 'leave' | 'error' | 'connected' | 'disconnected', callback: Function): void;
+    on(event: 'join' | 'leave' | 'error' | 'connected' | 'disconnected' | 'message', callback: Function): void;
     /**
      * Unsubscribe from sync events
      */
