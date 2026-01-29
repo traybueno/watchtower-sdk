@@ -18,7 +18,12 @@
   "scripts": {
     "build": "tsup src/index.ts --format cjs,esm --dts --clean",
     "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
-    "prepublishOnly": "npm run build"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:security": "vitest run test/security.test.ts",
+    "test:integration": "WATCHTOWER_API_KEY=$WATCHTOWER_API_KEY vitest run test/integration.test.ts",
+    "prepublishOnly": "npm run test && npm run build"
   },
   "keywords": [
     "game",
@@ -36,7 +41,9 @@
   },
   "homepage": "https://watchtower.host",
   "devDependencies": {
+    "@vitest/coverage-v8": "^4.0.18",
     "tsup": "^8.0.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vitest": "^4.0.18"
   }
 }

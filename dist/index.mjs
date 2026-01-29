@@ -258,20 +258,28 @@ var Room = class {
 };
 var Watchtower = class {
   constructor(config) {
-    this.config = {
-      gameId: config.gameId,
-      playerId: config.playerId || this.generatePlayerId(),
-      apiUrl: config.apiUrl || "https://watchtower-api.watchtower-host.workers.dev",
-      apiKey: config.apiKey || ""
-    };
+    Object.defineProperty(this, "config", {
+      value: {
+        gameId: config.gameId,
+        playerId: config.playerId || this.generatePlayerId(),
+        apiUrl: config.apiUrl || "https://watchtower-api.watchtower-host.workers.dev",
+        apiKey: config.apiKey || ""
+      },
+      writable: false,
+      enumerable: false,
+      configurable: false
+    });
   }
   generatePlayerId() {
-    if (typeof localStorage !== "undefined") {
-      const stored = localStorage.getItem("watchtower_player_id");
-      if (stored) return stored;
-      const id = "player_" + Math.random().toString(36).substring(2, 11);
-      localStorage.setItem("watchtower_player_id", id);
-      return id;
+    try {
+      if (typeof localStorage !== "undefined") {
+        const stored = localStorage.getItem("watchtower_player_id");
+        if (stored) return stored;
+        const id = "player_" + Math.random().toString(36).substring(2, 11);
+        localStorage.setItem("watchtower_player_id", id);
+        return id;
+      }
+    } catch {
     }
     return "player_" + Math.random().toString(36).substring(2, 11);
   }
@@ -296,7 +304,8 @@ var Watchtower = class {
     const response = await fetch(`${this.config.apiUrl}${path}`, {
       method,
       headers,
-      body: body ? JSON.stringify(body) : void 0
+      // Use !== undefined to handle falsy values like null, 0, false, ''
+      body: body !== void 0 ? JSON.stringify(body) : void 0
     });
     const data = await response.json();
     if (!response.ok) {

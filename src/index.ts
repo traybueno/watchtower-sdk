@@ -473,26 +473,38 @@ export class Room {
 // ============ MAIN CLASS ============
 
 export class Watchtower {
-  private config: Required<WatchtowerConfig>
+  /** @internal - Config is non-enumerable to prevent accidental API key exposure */
+  private readonly config!: Required<WatchtowerConfig>
 
   constructor(config: WatchtowerConfig) {
-    this.config = {
-      gameId: config.gameId,
-      playerId: config.playerId || this.generatePlayerId(),
-      apiUrl: config.apiUrl || 'https://watchtower-api.watchtower-host.workers.dev',
-      apiKey: config.apiKey || ''
-    }
+    // Define config as non-enumerable to prevent JSON.stringify from exposing API key
+    Object.defineProperty(this, 'config', {
+      value: {
+        gameId: config.gameId,
+        playerId: config.playerId || this.generatePlayerId(),
+        apiUrl: config.apiUrl || 'https://watchtower-api.watchtower-host.workers.dev',
+        apiKey: config.apiKey || ''
+      },
+      writable: false,
+      enumerable: false,
+      configurable: false
+    })
   }
 
   private generatePlayerId(): string {
     // Check for existing ID in localStorage (browser) or generate new
-    if (typeof localStorage !== 'undefined') {
-      const stored = localStorage.getItem('watchtower_player_id')
-      if (stored) return stored
+    try {
+      if (typeof localStorage !== 'undefined') {
+        const stored = localStorage.getItem('watchtower_player_id')
+        if (stored) return stored
 
-      const id = 'player_' + Math.random().toString(36).substring(2, 11)
-      localStorage.setItem('watchtower_player_id', id)
-      return id
+        const id = 'player_' + Math.random().toString(36).substring(2, 11)
+        localStorage.setItem('watchtower_player_id', id)
+        return id
+      }
+    } catch {
+      // localStorage may throw in some environments (e.g., sandboxed iframes)
+      // Fall through to generate a new ID
     }
     return 'player_' + Math.random().toString(36).substring(2, 11)
   }
@@ -527,7 +539,8 @@ export class Watchtower {
     const response = await fetch(`${this.config.apiUrl}${path}`, {
       method,
       headers,
-      body: body ? JSON.stringify(body) : undefined
+      // Use !== undefined to handle falsy values like null, 0, false, ''
+      body: body !== undefined ? JSON.stringify(body) : undefined
     })
 
     const data = await response.json()

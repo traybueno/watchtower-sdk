@@ -207,7 +207,8 @@ declare class Room {
     get connected(): boolean;
 }
 declare class Watchtower {
-    private config;
+    /** @internal - Config is non-enumerable to prevent accidental API key exposure */
+    private readonly config;
     constructor(config: WatchtowerConfig);
     private generatePlayerId;
     /** Get the current player ID */
