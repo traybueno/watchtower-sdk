@@ -598,6 +598,17 @@ export class Sync<T extends Record<string, unknown>> {
   }
 
   /**
+   * Send a one-off message to all players in the room
+   * 
+   * @param data - Any JSON-serializable data
+   */
+  broadcast(data: unknown): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'broadcast', data }))
+    }
+  }
+
+  /**
    * Create a new room and join it
    * 
    * @param options - Room creation options
@@ -630,7 +641,7 @@ export class Sync<T extends Record<string, unknown>> {
   /**
    * Subscribe to sync events
    */
-  on(event: 'join' | 'leave' | 'error' | 'connected' | 'disconnected', callback: Function): void {
+  on(event: 'join' | 'leave' | 'error' | 'connected' | 'disconnected' | 'message', callback: Function): void {
     if (!this.listeners.has(event)) {
       this.listeners.set(event, new Set())
     }
@@ -729,6 +740,11 @@ export class Sync<T extends Record<string, unknown>> {
         // Player left - remove from state
         this.removePlayer(data.playerId)
         this.emit('leave', data.playerId)
+        break
+
+      case 'message':
+        // Broadcast message from another player
+        this.emit('message', data.from, data.data)
         break
     }
   }
