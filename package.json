@@ -1,5 +1,5 @@
 {
-  "name": "@watchtower/sdk",
+  "name": "@watchtower-sdk/sdk",
   "version": "0.2.0",
   "description": "Simple game backend SDK - saves, multiplayer rooms, and more",
   "main": "dist/index.js",
