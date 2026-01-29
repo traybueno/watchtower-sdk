@@ -62,6 +62,38 @@ interface RoomInfo {
     players: PlayerInfo[];
     playerCount: number;
 }
+/** Game-wide stats */
+interface GameStats {
+    /** Players currently online */
+    online: number;
+    /** Unique players today (DAU) */
+    today: number;
+    /** Unique players this month (MAU) */
+    monthly: number;
+    /** Total unique players all time */
+    total: number;
+    /** Currently active rooms */
+    rooms: number;
+    /** Players currently in multiplayer rooms */
+    inRooms: number;
+    /** Average session length in seconds */
+    avgSession: number;
+    /** Average players per room */
+    avgRoomSize: number;
+    /** Last update timestamp */
+    updatedAt: number | null;
+}
+/** Current player's stats */
+interface PlayerStats {
+    /** When the player first connected */
+    firstSeen: string | null;
+    /** When the player last connected */
+    lastSeen: string | null;
+    /** Total sessions */
+    sessions: number;
+    /** Total playtime in seconds */
+    playtime: number;
+}
 /** Player state - position, animation, custom data */
 type PlayerState = Record<string, unknown>;
 /** All players' states indexed by player ID */
@@ -220,6 +252,44 @@ declare class Watchtower {
      * @param code - The 4-letter room code
      */
     getRoomInfo(code: string): Promise<RoomInfo>;
+    /**
+     * Get game-wide stats
+     * @returns Stats like online players, DAU, rooms active, etc.
+     *
+     * @example
+     * ```ts
+     * const stats = await wt.getStats()
+     * console.log(`${stats.online} players online`)
+     * console.log(`${stats.rooms} active rooms`)
+     * ```
+     */
+    getStats(): Promise<GameStats>;
+    /**
+     * Get the current player's stats
+     * @returns Player's firstSeen, sessions count, playtime
+     *
+     * @example
+     * ```ts
+     * const me = await wt.getPlayerStats()
+     * console.log(`You've played ${Math.floor(me.playtime / 3600)} hours`)
+     * console.log(`Member since ${new Date(me.firstSeen).toLocaleDateString()}`)
+     * ```
+     */
+    getPlayerStats(): Promise<PlayerStats>;
+    /**
+     * Track a session start (call on game load)
+     * This is called automatically if you use createRoom/joinRoom
+     */
+    trackSessionStart(): Promise<void>;
+    /**
+     * Track a session end (call on game close)
+     */
+    trackSessionEnd(): Promise<void>;
+    /**
+     * Convenience getter for stats (same as getStats but as property style)
+     * Note: This returns a promise, use `await wt.stats` or `wt.getStats()`
+     */
+    get stats(): Promise<GameStats>;
 }
 
-export { type GameState, type PlayerInfo, type PlayerState, type PlayersState, Room, type RoomEventMap, type RoomInfo, type SaveData, Watchtower, type WatchtowerConfig, Watchtower as default };
+export { type GameState, type GameStats, type PlayerInfo, type PlayerState, type PlayerStats, type PlayersState, Room, type RoomEventMap, type RoomInfo, type SaveData, Watchtower, type WatchtowerConfig, Watchtower as default };

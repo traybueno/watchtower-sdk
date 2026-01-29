@@ -146,7 +146,11 @@ var Room = class {
   async connect() {
     return new Promise((resolve, reject) => {
       const wsUrl = this.config.apiUrl.replace("https://", "wss://").replace("http://", "ws://");
-      const url = `${wsUrl}/v1/rooms/${this.code}/ws?playerId=${this.config.playerId}`;
+      const params = new URLSearchParams({
+        playerId: this.config.playerId,
+        ...this.config.apiKey ? { apiKey: this.config.apiKey } : {}
+      });
+      const url = `${wsUrl}/v1/rooms/${this.code}/ws?${params}`;
       this.ws = new WebSocket(url);
       this.ws.onopen = () => {
         this.player.startSync();
@@ -395,6 +399,55 @@ var Watchtower = class {
   async getRoomInfo(code) {
     code = code.toUpperCase().trim();
     return this.fetch("GET", `/v1/rooms/${code}`);
+  }
+  // ============ STATS API ============
+  /**
+   * Get game-wide stats
+   * @returns Stats like online players, DAU, rooms active, etc.
+   * 
+   * @example
+   * ```ts
+   * const stats = await wt.getStats()
+   * console.log(`${stats.online} players online`)
+   * console.log(`${stats.rooms} active rooms`)
+   * ```
+   */
+  async getStats() {
+    return this.fetch("GET", "/v1/stats");
+  }
+  /**
+   * Get the current player's stats
+   * @returns Player's firstSeen, sessions count, playtime
+   * 
+   * @example
+   * ```ts
+   * const me = await wt.getPlayerStats()
+   * console.log(`You've played ${Math.floor(me.playtime / 3600)} hours`)
+   * console.log(`Member since ${new Date(me.firstSeen).toLocaleDateString()}`)
+   * ```
+   */
+  async getPlayerStats() {
+    return this.fetch("GET", "/v1/stats/player");
+  }
+  /**
+   * Track a session start (call on game load)
+   * This is called automatically if you use createRoom/joinRoom
+   */
+  async trackSessionStart() {
+    await this.fetch("POST", "/v1/stats/track", { event: "session_start" });
+  }
+  /**
+   * Track a session end (call on game close)
+   */
+  async trackSessionEnd() {
+    await this.fetch("POST", "/v1/stats/track", { event: "session_end" });
+  }
+  /**
+   * Convenience getter for stats (same as getStats but as property style)
+   * Note: This returns a promise, use `await wt.stats` or `wt.getStats()`
+   */
+  get stats() {
+    return this.getStats();
   }
 };
 var index_default = Watchtower;

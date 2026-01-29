@@ -69,6 +69,40 @@ export interface RoomInfo {
   playerCount: number
 }
 
+/** Game-wide stats */
+export interface GameStats {
+  /** Players currently online */
+  online: number
+  /** Unique players today (DAU) */
+  today: number
+  /** Unique players this month (MAU) */
+  monthly: number
+  /** Total unique players all time */
+  total: number
+  /** Currently active rooms */
+  rooms: number
+  /** Players currently in multiplayer rooms */
+  inRooms: number
+  /** Average session length in seconds */
+  avgSession: number
+  /** Average players per room */
+  avgRoomSize: number
+  /** Last update timestamp */
+  updatedAt: number | null
+}
+
+/** Current player's stats */
+export interface PlayerStats {
+  /** When the player first connected */
+  firstSeen: string | null
+  /** When the player last connected */
+  lastSeen: string | null
+  /** Total sessions */
+  sessions: number
+  /** Total playtime in seconds */
+  playtime: number
+}
+
 /** Player state - position, animation, custom data */
 export type PlayerState = Record<string, unknown>
 
@@ -266,7 +300,12 @@ export class Room {
         .replace('https://', 'wss://')
         .replace('http://', 'ws://')
       
-      const url = `${wsUrl}/v1/rooms/${this.code}/ws?playerId=${this.config.playerId}`
+      // Include apiKey in URL since WebSocket can't send custom headers
+      const params = new URLSearchParams({
+        playerId: this.config.playerId,
+        ...(this.config.apiKey ? { apiKey: this.config.apiKey } : {})
+      })
+      const url = `${wsUrl}/v1/rooms/${this.code}/ws?${params}`
       
       this.ws = new WebSocket(url)
 
@@ -577,6 +616,61 @@ export class Watchtower {
   async getRoomInfo(code: string): Promise<RoomInfo> {
     code = code.toUpperCase().trim()
     return this.fetch<RoomInfo>('GET', `/v1/rooms/${code}`)
+  }
+
+  // ============ STATS API ============
+
+  /**
+   * Get game-wide stats
+   * @returns Stats like online players, DAU, rooms active, etc.
+   * 
+   * @example
+   * ```ts
+   * const stats = await wt.getStats()
+   * console.log(`${stats.online} players online`)
+   * console.log(`${stats.rooms} active rooms`)
+   * ```
+   */
+  async getStats(): Promise<GameStats> {
+    return this.fetch<GameStats>('GET', '/v1/stats')
+  }
+
+  /**
+   * Get the current player's stats
+   * @returns Player's firstSeen, sessions count, playtime
+   * 
+   * @example
+   * ```ts
+   * const me = await wt.getPlayerStats()
+   * console.log(`You've played ${Math.floor(me.playtime / 3600)} hours`)
+   * console.log(`Member since ${new Date(me.firstSeen).toLocaleDateString()}`)
+   * ```
+   */
+  async getPlayerStats(): Promise<PlayerStats> {
+    return this.fetch<PlayerStats>('GET', '/v1/stats/player')
+  }
+
+  /**
+   * Track a session start (call on game load)
+   * This is called automatically if you use createRoom/joinRoom
+   */
+  async trackSessionStart(): Promise<void> {
+    await this.fetch('POST', '/v1/stats/track', { event: 'session_start' })
+  }
+
+  /**
+   * Track a session end (call on game close)
+   */
+  async trackSessionEnd(): Promise<void> {
+    await this.fetch('POST', '/v1/stats/track', { event: 'session_end' })
+  }
+
+  /**
+   * Convenience getter for stats (same as getStats but as property style)
+   * Note: This returns a promise, use `await wt.stats` or `wt.getStats()`
+   */
+  get stats(): Promise<GameStats> {
+    return this.getStats()
   }
 }
 
