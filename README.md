@@ -1,6 +1,6 @@
 # @watchtower-sdk/core
 
-Simple game backend SDK - cloud saves, multiplayer rooms, automatic state sync.
+Simple game backend SDK - cloud saves and multiplayer.
 
 ## Installation
 
@@ -19,73 +19,74 @@ const wt = new Watchtower({
 })
 
 // Cloud saves
-await wt.save('progress', { level: 5, coins: 100 })
+await wt.save('progress', { level: 5 })
 const data = await wt.load('progress')
 
-// Multiplayer - the easy way
+// Multiplayer
 const state = { players: {} }
 const sync = wt.sync(state)
-await sync.join('my-room')
-
-state.players[sync.myId] = { x: 0, y: 0 }  // Add yourself
-state.players[sync.myId].x = 100           // Move (auto-syncs!)
-// Other players appear in state.players automatically!
+await sync.join('room-code')
+state.players[sync.myId] = { x: 0, y: 0 }
+// Others appear in state.players automatically!
 ```
 
-## State Sync (Recommended)
+## Cloud Saves
 
-The easiest way to add multiplayer. Point Watchtower at your game state object - it handles everything.
+Key-value storage per player. JSON in, JSON out.
 
 ```typescript
-// 1. Your game state (you probably already have this)
-const state = {
-  players: {}
-}
+// Save
+await wt.save('progress', { level: 5, coins: 100 })
+await wt.save('settings', { music: true, sfx: true })
 
-// 2. Connect it to Watchtower
+// Load
+const progress = await wt.load('progress')
+const settings = await wt.load('settings')
+
+// List all saves
+const keys = await wt.listSaves() // ['progress', 'settings']
+
+// Delete
+await wt.deleteSave('progress')
+```
+
+## Multiplayer
+
+Point at your game state. Join a room. State syncs automatically.
+
+```typescript
+// Your game state
+const state = { players: {} }
+
+// Connect to Watchtower
 const sync = wt.sync(state)
 
-// 3. Join a room
+// Join a room
 await sync.join('my-room')
 
-// 4. Add yourself
+// Add yourself
 state.players[sync.myId] = {
   x: 0,
   y: 0,
-  name: 'Player1',
-  color: 0xff0000
+  name: 'Player1'
 }
 
-// 5. Move around (automatically syncs to others!)
-function gameLoop() {
-  state.players[sync.myId].x += velocity.x
-  state.players[sync.myId].y += velocity.y
-}
+// Move (automatically syncs to others!)
+state.players[sync.myId].x += 5
 
-// 6. Draw everyone (others appear automatically!)
-function render() {
-  for (const [id, player] of Object.entries(state.players)) {
-    drawPlayer(player.x, player.y, player.color)
-  }
+// Draw everyone (others appear automatically!)
+for (const [id, player] of Object.entries(state.players)) {
+  drawPlayer(player.x, player.y)
 }
 ```
 
-That's it. No events, no callbacks, no message handling. Just read and write your state object.
+No events. No message handlers. Just read and write your state.
 
-### Sync Options
-
-```typescript
-const sync = wt.sync(state, {
-  tickRate: 20,       // Updates per second (default: 20)
-  interpolate: true   // Smooth remote player movement (default: true)
-})
-```
-
-### Room Management
+### Creating & Joining Rooms
 
 ```typescript
-// Create a new room (returns room code)
-const code = await sync.create({ maxPlayers: 4, public: true })
+// Create a new room
+const code = await sync.create({ maxPlayers: 4 })
 console.log('Share this code:', code)  // e.g., "A3B7X2"
 
 // Join existing room
@@ -96,269 +97,90 @@ await sync.leave()
 
 // List public rooms
 const rooms = await sync.listRooms()
-// [{ id: 'A3B7X2', players: 2 }, { id: 'K9M2P1', players: 3 }]
+```
+
+### Options
+
+```typescript
+const sync = wt.sync(state, {
+  tickRate: 20,       // Updates per second (default: 20)
+  interpolate: true   // Smooth remote movement (default: true)
+})
+```
+
+### Properties
+
+```typescript
+sync.myId      // Your player ID
+sync.roomId    // Current room, or null
+sync.connected // WebSocket connected?
 ```
 
 ### Events (Optional)
 
+You don't need events—just read your state. But if you want notifications:
+
 ```typescript
-sync.on('join', (playerId) => console.log(playerId, 'joined!'))
-sync.on('leave', (playerId) => console.log(playerId, 'left!'))
-sync.on('connected', () => console.log('Connected to room'))
+sync.on('join', (playerId) => console.log(playerId, 'joined'))
+sync.on('leave', (playerId) => console.log(playerId, 'left'))
+sync.on('connected', () => console.log('Connected'))
 sync.on('disconnected', () => console.log('Disconnected'))
 ```
 
-## Cloud Saves
+### Chat & Messages
 
-Simple key-value storage per player. Works across devices.
-
-```typescript
-// Save anything JSON-serializable
-await wt.save('progress', { level: 5, coins: 100 })
-await wt.save('settings', { music: true, sfx: true })
-await wt.save('inventory', ['sword', 'shield', 'potion'])
-
-// Load it back
-const progress = await wt.load('progress')
-const settings = await wt.load('settings')
-
-// List all save keys
-const keys = await wt.listSaves() // ['progress', 'settings', 'inventory']
-
-// Delete a save
-await wt.deleteSave('inventory')
-```
-
-## Multiplayer Rooms
-
-Create rooms with 4-letter codes. Share with friends to play together.
+Messages are just state:
 
 ```typescript
-// Create a room (you become the host)
-const room = await wt.createRoom()
-console.log('Room code:', room.code)
-
-// Join an existing room
-const room = await wt.joinRoom('ABCD')
-
-// Check room properties
-room.isHost      // true if you're the host
-room.hostId      // current host's player ID
-room.playerId    // your player ID
-room.playerCount // number of players
-room.players     // all players' states
+state.chat = [
+  ...state.chat.slice(-50),  // Keep last 50
+  { from: sync.myId, text: 'Hello!', ts: Date.now() }
+]
 ```
 
-## Player State Sync
-
-Automatically sync your player's position/state to all other players.
-
-```typescript
-// Set your player state (automatically synced at 20Hz)
-room.player.set({
-  x: 100,
-  y: 200,
-  sprite: 'running',
-  health: 100
-})
-
-// State is merged, so you can update individual fields
-room.player.set({ x: 150 }) // keeps y, sprite, health
-
-// Force immediate sync
-room.player.sync()
-
-// See all players' states
-room.on('players', (players) => {
-  for (const [playerId, state] of Object.entries(players)) {
-    if (playerId !== room.playerId) {
-      // Update other player's sprite
-      updateOtherPlayer(playerId, state.x, state.y, state.sprite)
-    }
-  }
-})
-```
-
-## Game State (Host-Controlled)
-
-Shared state for things like game phase, scores, round number. Only the host can modify it.
-
-```typescript
-// Host sets game state
-if (room.isHost) {
-  room.state.set({
-    phase: 'lobby',
-    round: 0,
-    scores: {}
-  })
-  
-  // Start the game
-  room.state.set({ phase: 'playing', round: 1 })
-}
-
-// Everyone receives state updates
-room.on('state', (state) => {
-  if (state.phase === 'playing') {
-    startGame()
-  }
-  if (state.phase === 'gameover') {
-    showWinner(state.winner)
-  }
-})
-
-// Read current state anytime
-const currentState = room.state.get()
-```
-
-## Broadcast Messages
-
-For one-off events that don't need persistent state.
-
-```typescript
-// Broadcast to all players
-room.broadcast({ type: 'explosion', x: 50, y: 50 })
-room.broadcast({ type: 'chat', message: 'gg!' })
-
-// Send to specific player
-room.sendTo(playerId, { type: 'private_message', text: 'hey' })
-
-// Receive messages
-room.on('message', (from, data) => {
-  if (data.type === 'explosion') {
-    createExplosion(data.x, data.y)
-  }
-  if (data.type === 'chat') {
-    showChat(from, data.message)
-  }
-})
-```
-
-## Room Events
-
-```typescript
-// Connection established
-room.on('connected', ({ playerId, room }) => {
-  console.log('Connected as', playerId)
-  console.log('Host is', room.hostId)
-})
-
-// Player joined
-room.on('playerJoined', (playerId, playerCount) => {
-  console.log(`${playerId} joined (${playerCount} players)`)
-  spawnPlayer(playerId)
-})
-
-// Player left
-room.on('playerLeft', (playerId, playerCount) => {
-  console.log(`${playerId} left (${playerCount} players)`)
-  removePlayer(playerId)
-})
-
-// Host changed (automatic migration when host leaves)
-room.on('hostChanged', (newHostId) => {
-  console.log('New host:', newHostId)
-  if (newHostId === room.playerId) {
-    console.log("I'm the host now!")
-  }
-})
-
-// Disconnected
-room.on('disconnected', () => {
-  console.log('Lost connection')
-})
-
-// Error
-room.on('error', (error) => {
-  console.error('Room error:', error)
-})
-```
-
-## Host Transfer
-
-```typescript
-// Host can transfer to another player
-if (room.isHost) {
-  room.transferHost(otherPlayerId)
-}
-```
-
-## Full Example: Simple Multiplayer Game
+## Full Example
 
 ```typescript
 import { Watchtower } from '@watchtower-sdk/core'
 
 const wt = new Watchtower({ gameId: 'my-game', apiKey: 'wt_...' })
+const state = { players: {} }
+const sync = wt.sync(state)
 
 // Join or create room
-async function joinGame(code?: string) {
-  const room = code 
-    ? await wt.joinRoom(code)
-    : await wt.createRoom()
-  
-  console.log('Room:', room.code)
-  
-  // Game loop - update player position
-  function gameLoop() {
-    room.player.set({
-      x: myPlayer.x,
-      y: myPlayer.y,
-      animation: myPlayer.currentAnim
-    })
-    requestAnimationFrame(gameLoop)
-  }
-  gameLoop()
-  
-  // Render other players
-  const otherPlayers: Record<string, Sprite> = {}
-  
-  room.on('players', (players) => {
-    for (const [id, state] of Object.entries(players)) {
-      if (id === room.playerId) continue
-      
-      // Create sprite if new player
-      if (!otherPlayers[id]) {
-        otherPlayers[id] = createSprite()
-      }
-      
-      // Update position
-      otherPlayers[id].x = state.x as number
-      otherPlayers[id].y = state.y as number
-      otherPlayers[id].play(state.animation as string)
-    }
-  })
-  
-  // Clean up when players leave
-  room.on('playerLeft', (id) => {
-    otherPlayers[id]?.destroy()
-    delete otherPlayers[id]
-  })
-  
-  // Handle game events
-  room.on('message', (from, data: any) => {
-    if (data.type === 'shoot') {
-      createBullet(data.x, data.y, data.dir)
-    }
-  })
-  
-  // Game state (host manages rounds, scores)
-  room.on('state', (state: any) => {
-    if (state.phase === 'playing') {
-      showRound(state.round)
-    }
-    if (state.phase === 'gameover') {
-      showWinner(state.winner)
-    }
-  })
-  
-  // If we're host, start game when 2 players join
-  room.on('playerJoined', (_, count) => {
-    if (room.isHost && count >= 2) {
-      room.state.set({ phase: 'playing', round: 1 })
-    }
-  })
-  
-  return room
+const code = prompt('Room code? (blank to create)')
+if (code) {
+  await sync.join(code)
+} else {
+  const newCode = await sync.create()
+  alert('Share: ' + newCode)
 }
+
+// Add yourself
+state.players[sync.myId] = {
+  x: Math.random() * 800,
+  y: Math.random() * 600,
+  color: '#' + Math.floor(Math.random()*16777215).toString(16)
+}
+
+// Game loop
+function loop() {
+  // Move
+  if (keys.left)  state.players[sync.myId].x -= 5
+  if (keys.right) state.players[sync.myId].x += 5
+  if (keys.up)    state.players[sync.myId].y -= 5
+  if (keys.down)  state.players[sync.myId].y += 5
+  
+  // Draw everyone
+  ctx.clearRect(0, 0, 800, 600)
+  for (const [id, p] of Object.entries(state.players)) {
+    ctx.fillStyle = p.color
+    ctx.fillRect(p.x - 10, p.y - 10, 20, 20)
+  }
+  
+  requestAnimationFrame(loop)
+}
+loop()
 ```
 
 ## API Reference
@@ -366,51 +188,40 @@ async function joinGame(code?: string) {
 ### Watchtower
 
 ```typescript
-const wt = new Watchtower(config)
+const wt = new Watchtower({
+  gameId: string,    // From dashboard
+  apiKey?: string,   // From dashboard
+  playerId?: string  // Auto-generated if not provided
+})
+
+wt.playerId  // Current player ID
+wt.gameId    // Game ID
+
+// Saves
+await wt.save(key: string, data: any): Promise<void>
+await wt.load<T>(key: string): Promise<T | null>
+await wt.listSaves(): Promise<string[]>
+await wt.deleteSave(key: string): Promise<void>
+
+// Multiplayer
+wt.sync(state: object, options?: SyncOptions): Sync
 ```
 
-| Config | Type | Description |
-|--------|------|-------------|
-| `gameId` | `string` | Your game's unique identifier |
-| `apiKey` | `string` | API key from dashboard |
-| `playerId` | `string?` | Custom player ID (auto-generated if not provided) |
-| `apiUrl` | `string?` | Custom API URL (default: Watchtower API) |
+### Sync
 
-### Room
+```typescript
+sync.myId: string
+sync.roomId: string | null
+sync.connected: boolean
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `code` | `string` | 4-letter room code |
-| `isHost` | `boolean` | True if you're the host |
-| `hostId` | `string` | Current host's player ID |
-| `playerId` | `string` | Your player ID |
-| `playerCount` | `number` | Number of players |
-| `players` | `PlayersState` | All players' states |
-| `connected` | `boolean` | Connection status |
+await sync.join(roomId: string, options?: JoinOptions): Promise<void>
+await sync.leave(): Promise<void>
+await sync.create(options?: CreateOptions): Promise<string>
+await sync.listRooms(): Promise<RoomListing[]>
 
-| Method | Description |
-|--------|-------------|
-| `player.set(state)` | Set your player state (auto-synced) |
-| `player.get()` | Get your current player state |
-| `player.sync()` | Force immediate sync |
-| `state.set(state)` | Set game state (host only) |
-| `state.get()` | Get current game state |
-| `broadcast(data)` | Send to all players |
-| `sendTo(id, data)` | Send to specific player |
-| `transferHost(id)` | Transfer host (host only) |
-| `disconnect()` | Leave the room |
-
-| Event | Callback | Description |
-|-------|----------|-------------|
-| `connected` | `({playerId, room}) => void` | Connected to room |
-| `players` | `(players) => void` | Player states updated |
-| `state` | `(state) => void` | Game state updated |
-| `playerJoined` | `(id, count) => void` | Player joined |
-| `playerLeft` | `(id, count) => void` | Player left |
-| `hostChanged` | `(newHostId) => void` | Host changed |
-| `message` | `(from, data) => void` | Received broadcast |
-| `disconnected` | `() => void` | Lost connection |
-| `error` | `(error) => void` | Error occurred |
+sync.on(event: string, callback: Function): void
+sync.off(event: string, callback: Function): void
+```
 
 ## License
 
