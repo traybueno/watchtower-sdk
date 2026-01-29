@@ -22,9 +22,90 @@ const wt = new Watchtower({
 await wt.save('progress', { level: 5, coins: 100 })
 const data = await wt.load('progress')
 
-// Multiplayer
-const room = await wt.createRoom()
-console.log('Share this code:', room.code) // e.g., "ABCD"
+// Multiplayer - the easy way
+const state = { players: {} }
+const sync = wt.sync(state)
+await sync.join('my-room')
+
+state.players[sync.myId] = { x: 0, y: 0 }  // Add yourself
+state.players[sync.myId].x = 100           // Move (auto-syncs!)
+// Other players appear in state.players automatically!
+```
+
+## State Sync (Recommended)
+
+The easiest way to add multiplayer. Point Watchtower at your game state object - it handles everything.
+
+```typescript
+// 1. Your game state (you probably already have this)
+const state = {
+  players: {}
+}
+
+// 2. Connect it to Watchtower
+const sync = wt.sync(state)
+
+// 3. Join a room
+await sync.join('my-room')
+
+// 4. Add yourself
+state.players[sync.myId] = {
+  x: 0,
+  y: 0,
+  name: 'Player1',
+  color: 0xff0000
+}
+
+// 5. Move around (automatically syncs to others!)
+function gameLoop() {
+  state.players[sync.myId].x += velocity.x
+  state.players[sync.myId].y += velocity.y
+}
+
+// 6. Draw everyone (others appear automatically!)
+function render() {
+  for (const [id, player] of Object.entries(state.players)) {
+    drawPlayer(player.x, player.y, player.color)
+  }
+}
+```
+
+That's it. No events, no callbacks, no message handling. Just read and write your state object.
+
+### Sync Options
+
+```typescript
+const sync = wt.sync(state, {
+  tickRate: 20,       // Updates per second (default: 20)
+  interpolate: true   // Smooth remote player movement (default: true)
+})
+```
+
+### Room Management
+
+```typescript
+// Create a new room (returns room code)
+const code = await sync.create({ maxPlayers: 4, public: true })
+console.log('Share this code:', code)  // e.g., "A3B7X2"
+
+// Join existing room
+await sync.join('A3B7X2')
+
+// Leave room
+await sync.leave()
+
+// List public rooms
+const rooms = await sync.listRooms()
+// [{ id: 'A3B7X2', players: 2 }, { id: 'K9M2P1', players: 3 }]
+```
+
+### Events (Optional)
+
+```typescript
+sync.on('join', (playerId) => console.log(playerId, 'joined!'))
+sync.on('leave', (playerId) => console.log(playerId, 'left!'))
+sync.on('connected', () => console.log('Connected to room'))
+sync.on('disconnected', () => console.log('Disconnected'))
 ```
 
 ## Cloud Saves

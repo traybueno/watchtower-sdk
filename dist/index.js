@@ -21,6 +21,7 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 var index_exports = {};
 __export(index_exports, {
   Room: () => Room,
+  Sync: () => Sync,
   Watchtower: () => Watchtower,
   default: () => index_default
 });
@@ -282,6 +283,285 @@ var Room = class {
     return this.ws?.readyState === WebSocket.OPEN;
   }
 };
+var Sync = class {
+  constructor(state, config, options) {
+    this._roomId = null;
+    this.ws = null;
+    this.syncInterval = null;
+    this.lastSentState = "";
+    this.interpolationTargets = /* @__PURE__ */ new Map();
+    this.listeners = /* @__PURE__ */ new Map();
+    this.state = state;
+    this.myId = config.playerId;
+    this.config = config;
+    this.options = {
+      tickRate: options?.tickRate ?? 20,
+      interpolate: options?.interpolate ?? true
+    };
+  }
+  /** Current room ID (null if not in a room) */
+  get roomId() {
+    return this._roomId;
+  }
+  /** Whether currently connected to a room */
+  get connected() {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+  /**
+   * Join a room - your state will sync with everyone in this room
+   * 
+   * @param roomId - Room identifier (any string)
+   * @param options - Join options
+   */
+  async join(roomId, options) {
+    if (this._roomId) {
+      await this.leave();
+    }
+    this._roomId = roomId;
+    await this.connectWebSocket(roomId, options);
+    this.startSyncLoop();
+  }
+  /**
+   * Leave the current room
+   */
+  async leave() {
+    this.stopSyncLoop();
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    this.clearRemotePlayers();
+    this._roomId = null;
+  }
+  /**
+   * Create a new room and join it
+   * 
+   * @param options - Room creation options
+   * @returns The room code/ID
+   */
+  async create(options) {
+    const code = this.generateRoomCode();
+    await this.join(code, { ...options, create: true });
+    return code;
+  }
+  /**
+   * List public rooms
+   */
+  async listRooms() {
+    const response = await fetch(`${this.config.apiUrl}/v1/sync/rooms?gameId=${this.config.gameId}`, {
+      headers: this.getHeaders()
+    });
+    if (!response.ok) {
+      const data2 = await response.json();
+      throw new Error(data2.error || "Failed to list rooms");
+    }
+    const data = await response.json();
+    return data.rooms || [];
+  }
+  /**
+   * Subscribe to sync events
+   */
+  on(event, callback) {
+    if (!this.listeners.has(event)) {
+      this.listeners.set(event, /* @__PURE__ */ new Set());
+    }
+    this.listeners.get(event).add(callback);
+  }
+  /**
+   * Unsubscribe from sync events
+   */
+  off(event, callback) {
+    this.listeners.get(event)?.delete(callback);
+  }
+  emit(event, ...args) {
+    this.listeners.get(event)?.forEach((cb) => {
+      try {
+        cb(...args);
+      } catch (e) {
+        console.error(`Error in sync ${event} handler:`, e);
+      }
+    });
+  }
+  async connectWebSocket(roomId, options) {
+    return new Promise((resolve, reject) => {
+      const wsUrl = this.config.apiUrl.replace("https://", "wss://").replace("http://", "ws://");
+      const params = new URLSearchParams({
+        playerId: this.config.playerId,
+        gameId: this.config.gameId,
+        ...this.config.apiKey ? { apiKey: this.config.apiKey } : {},
+        ...options?.create ? { create: "true" } : {},
+        ...options?.maxPlayers ? { maxPlayers: String(options.maxPlayers) } : {},
+        ...options?.public ? { public: "true" } : {},
+        ...options?.metadata ? { metadata: JSON.stringify(options.metadata) } : {}
+      });
+      const url = `${wsUrl}/v1/sync/${roomId}/ws?${params}`;
+      this.ws = new WebSocket(url);
+      const timeout = setTimeout(() => {
+        reject(new Error("Connection timeout"));
+        this.ws?.close();
+      }, 1e4);
+      this.ws.onopen = () => {
+        clearTimeout(timeout);
+        this.emit("connected");
+        resolve();
+      };
+      this.ws.onerror = () => {
+        clearTimeout(timeout);
+        const error = new Error("WebSocket connection failed");
+        this.emit("error", error);
+        reject(error);
+      };
+      this.ws.onclose = () => {
+        this.stopSyncLoop();
+        this.emit("disconnected");
+      };
+      this.ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          this.handleMessage(data);
+        } catch (e) {
+          console.error("Failed to parse sync message:", e);
+        }
+      };
+    });
+  }
+  handleMessage(data) {
+    switch (data.type) {
+      case "full_state":
+        this.applyFullState(data.state);
+        break;
+      case "state":
+        this.applyPlayerState(data.playerId, data.data);
+        break;
+      case "join":
+        this.emit("join", data.playerId);
+        break;
+      case "leave":
+        this.removePlayer(data.playerId);
+        this.emit("leave", data.playerId);
+        break;
+    }
+  }
+  applyFullState(fullState) {
+    for (const [playerId, playerState] of Object.entries(fullState)) {
+      if (playerId !== this.myId) {
+        this.applyPlayerState(playerId, playerState);
+      }
+    }
+  }
+  applyPlayerState(playerId, playerState) {
+    const playersKey = this.findPlayersKey();
+    if (!playersKey) return;
+    const players = this.state[playersKey];
+    if (this.options.interpolate && players[playerId]) {
+      this.interpolationTargets.set(playerId, {
+        target: { ...playerState },
+        current: { ...players[playerId] }
+      });
+    }
+    players[playerId] = playerState;
+  }
+  removePlayer(playerId) {
+    const playersKey = this.findPlayersKey();
+    if (!playersKey) return;
+    const players = this.state[playersKey];
+    delete players[playerId];
+    this.interpolationTargets.delete(playerId);
+  }
+  clearRemotePlayers() {
+    const playersKey = this.findPlayersKey();
+    if (!playersKey) return;
+    const players = this.state[playersKey];
+    for (const playerId of Object.keys(players)) {
+      if (playerId !== this.myId) {
+        delete players[playerId];
+      }
+    }
+    this.interpolationTargets.clear();
+  }
+  findPlayersKey() {
+    const candidates = ["players", "entities", "gnomes", "users", "clients"];
+    for (const key of candidates) {
+      if (key in this.state && typeof this.state[key] === "object") {
+        return key;
+      }
+    }
+    for (const key of Object.keys(this.state)) {
+      if (typeof this.state[key] === "object" && this.state[key] !== null) {
+        return key;
+      }
+    }
+    return null;
+  }
+  startSyncLoop() {
+    if (this.syncInterval) return;
+    const intervalMs = 1e3 / this.options.tickRate;
+    this.syncInterval = setInterval(() => {
+      this.syncMyState();
+      if (this.options.interpolate) {
+        this.updateInterpolation();
+      }
+    }, intervalMs);
+  }
+  stopSyncLoop() {
+    if (this.syncInterval) {
+      clearInterval(this.syncInterval);
+      this.syncInterval = null;
+    }
+  }
+  syncMyState() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const playersKey = this.findPlayersKey();
+    if (!playersKey) return;
+    const players = this.state[playersKey];
+    const myState = players[this.myId];
+    if (!myState) return;
+    const stateJson = JSON.stringify(myState);
+    if (stateJson === this.lastSentState) return;
+    this.lastSentState = stateJson;
+    this.ws.send(JSON.stringify({
+      type: "state",
+      data: myState
+    }));
+  }
+  updateInterpolation() {
+    const playersKey = this.findPlayersKey();
+    if (!playersKey) return;
+    const players = this.state[playersKey];
+    const lerpFactor = 0.2;
+    for (const [playerId, interp] of this.interpolationTargets) {
+      const player = players[playerId];
+      if (!player) continue;
+      for (const [key, targetValue] of Object.entries(interp.target)) {
+        if (typeof targetValue === "number" && typeof interp.current[key] === "number") {
+          const current = interp.current[key];
+          const newValue = current + (targetValue - current) * lerpFactor;
+          interp.current[key] = newValue;
+          player[key] = newValue;
+        }
+      }
+    }
+  }
+  generateRoomCode() {
+    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let code = "";
+    for (let i = 0; i < 6; i++) {
+      code += chars[Math.floor(Math.random() * chars.length)];
+    }
+    return code;
+  }
+  getHeaders() {
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Player-ID": this.config.playerId,
+      "X-Game-ID": this.config.gameId
+    };
+    if (this.config.apiKey) {
+      headers["Authorization"] = `Bearer ${this.config.apiKey}`;
+    }
+    return headers;
+  }
+};
 var Watchtower = class {
   constructor(config) {
     Object.defineProperty(this, "config", {
@@ -458,10 +738,44 @@ var Watchtower = class {
   get stats() {
     return this.getStats();
   }
+  // ============ SYNC API ============
+  /**
+   * Create a synchronized state object
+   * 
+   * Point this at your game state and it becomes multiplayer.
+   * No events, no callbacks - just read and write your state.
+   * 
+   * @param state - Your game state object (e.g., { players: {} })
+   * @param options - Sync options (tickRate, interpolation)
+   * @returns A Sync instance
+   * 
+   * @example
+   * ```ts
+   * const state = { players: {} }
+   * const sync = wt.sync(state)
+   * 
+   * await sync.join('my-room')
+   * 
+   * // Add yourself
+   * state.players[sync.myId] = { x: 0, y: 0 }
+   * 
+   * // Move (automatically syncs to others)
+   * state.players[sync.myId].x = 100
+   * 
+   * // Others appear automatically in state.players!
+   * for (const [id, player] of Object.entries(state.players)) {
+   *   draw(player.x, player.y)
+   * }
+   * ```
+   */
+  sync(state, options) {
+    return new Sync(state, this.config, options);
+  }
 };
 var index_default = Watchtower;
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   Room,
+  Sync,
   Watchtower
 });

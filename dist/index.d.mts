@@ -206,6 +206,117 @@ declare class Room {
     /** Check if connected */
     get connected(): boolean;
 }
+interface SyncOptions {
+    /** Updates per second (default: 20) */
+    tickRate?: number;
+    /** Enable interpolation for remote entities (default: true) */
+    interpolate?: boolean;
+}
+interface JoinOptions {
+    /** Create room if it doesn't exist */
+    create?: boolean;
+    /** Max players (only on create) */
+    maxPlayers?: number;
+    /** Make room public/discoverable (only on create) */
+    public?: boolean;
+    /** Room metadata (only on create) */
+    metadata?: Record<string, unknown>;
+}
+interface RoomListing {
+    id: string;
+    players: number;
+    maxPlayers?: number;
+    metadata?: Record<string, unknown>;
+    createdAt: number;
+}
+/**
+ * Sync - Automatic state synchronization
+ *
+ * Point this at your game state object and it becomes multiplayer.
+ * No events, no callbacks - just read and write your state.
+ *
+ * @example
+ * ```ts
+ * const state = { players: {} }
+ * const sync = wt.sync(state)
+ *
+ * await sync.join('my-room')
+ *
+ * // Add yourself
+ * state.players[sync.myId] = { x: 0, y: 0, name: 'Player1' }
+ *
+ * // Move (automatically syncs to others)
+ * state.players[sync.myId].x = 100
+ *
+ * // Others appear automatically in state.players!
+ * for (const [id, player] of Object.entries(state.players)) {
+ *   draw(player.x, player.y)
+ * }
+ * ```
+ */
+declare class Sync<T extends Record<string, unknown>> {
+    /** The synchronized state object */
+    readonly state: T;
+    /** Your player ID */
+    readonly myId: string;
+    /** Current room ID (null if not in a room) */
+    get roomId(): string | null;
+    /** Whether currently connected to a room */
+    get connected(): boolean;
+    private config;
+    private options;
+    private _roomId;
+    private ws;
+    private syncInterval;
+    private lastSentState;
+    private interpolationTargets;
+    private listeners;
+    constructor(state: T, config: Required<WatchtowerConfig>, options?: SyncOptions);
+    /**
+     * Join a room - your state will sync with everyone in this room
+     *
+     * @param roomId - Room identifier (any string)
+     * @param options - Join options
+     */
+    join(roomId: string, options?: JoinOptions): Promise<void>;
+    /**
+     * Leave the current room
+     */
+    leave(): Promise<void>;
+    /**
+     * Create a new room and join it
+     *
+     * @param options - Room creation options
+     * @returns The room code/ID
+     */
+    create(options?: Omit<JoinOptions, 'create'>): Promise<string>;
+    /**
+     * List public rooms
+     */
+    listRooms(): Promise<RoomListing[]>;
+    /**
+     * Subscribe to sync events
+     */
+    on(event: 'join' | 'leave' | 'error' | 'connected' | 'disconnected', callback: Function): void;
+    /**
+     * Unsubscribe from sync events
+     */
+    off(event: string, callback: Function): void;
+    private emit;
+    private connectWebSocket;
+    private handleMessage;
+    private applyFullState;
+    private applyPlayerState;
+    private removePlayer;
+    private clearRemotePlayers;
+    private findPlayersKey;
+    private startSyncLoop;
+    private stopSyncLoop;
+    private syncMyState;
+    private updateInterpolation;
+    private generateRoomCode;
+    private getHeaders;
+}
 declare class Watchtower {
     /** @internal - Config is non-enumerable to prevent accidental API key exposure */
     private readonly config;
@@ -291,6 +402,36 @@ declare class Watchtower {
      * Note: This returns a promise, use `await wt.stats` or `wt.getStats()`
      */
     get stats(): Promise<GameStats>;
+    /**
+     * Create a synchronized state object
+     *
+     * Point this at your game state and it becomes multiplayer.
+     * No events, no callbacks - just read and write your state.
+     *
+     * @param state - Your game state object (e.g., { players: {} })
+     * @param options - Sync options (tickRate, interpolation)
+     * @returns A Sync instance
+     *
+     * @example
+     * ```ts
+     * const state = { players: {} }
+     * const sync = wt.sync(state)
+     *
+     * await sync.join('my-room')
+     *
+     * // Add yourself
+     * state.players[sync.myId] = { x: 0, y: 0 }
+     *
+     * // Move (automatically syncs to others)
+     * state.players[sync.myId].x = 100
+     *
+     * // Others appear automatically in state.players!
+     * for (const [id, player] of Object.entries(state.players)) {
+     *   draw(player.x, player.y)
+     * }
+     * ```
+     */
+    sync<T extends Record<string, unknown>>(state: T, options?: SyncOptions): Sync<T>;
 }
 
-export { type GameState, type GameStats, type PlayerInfo, type PlayerState, type PlayerStats, type PlayersState, Room, type RoomEventMap, type RoomInfo, type SaveData, Watchtower, type WatchtowerConfig, Watchtower as default };
+export { type GameState, type GameStats, type JoinOptions, type PlayerInfo, type PlayerState, type PlayerStats, type PlayersState, Room, type RoomEventMap, type RoomInfo, type RoomListing, type SaveData, Sync, type SyncOptions, Watchtower, type WatchtowerConfig, Watchtower as default };
