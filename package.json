@@ -1,6 +1,6 @@
 {
   "name": "@watchtower-sdk/core",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Simple game backend SDK - saves, multiplayer rooms, and more",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
