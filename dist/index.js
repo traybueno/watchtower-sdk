@@ -288,15 +288,29 @@ var Sync = class {
     this._roomId = null;
     this.ws = null;
     this.syncInterval = null;
+    this.interpolationInterval = null;
     this.lastSentState = "";
-    this.interpolationTargets = /* @__PURE__ */ new Map();
     this.listeners = /* @__PURE__ */ new Map();
+    // Snapshot-based interpolation: store timestamped snapshots per player
+    this.snapshots = /* @__PURE__ */ new Map();
+    // Jitter buffer: queue incoming updates before applying
+    this.jitterQueue = [];
+    // Auto-reconnect state
+    this.reconnectAttempts = 0;
+    this.reconnectTimeout = null;
+    this.lastJoinOptions = void 0;
+    this.isReconnecting = false;
     this.state = state;
     this.myId = config.playerId;
     this.config = config;
     this.options = {
       tickRate: options?.tickRate ?? 20,
-      interpolate: options?.interpolate ?? true
+      interpolate: options?.interpolate ?? true,
+      interpolationDelay: options?.interpolationDelay ?? 100,
+      jitterBuffer: options?.jitterBuffer ?? 0,
+      // 0 = immediate, set to 50+ for smoothing
+      autoReconnect: options?.autoReconnect ?? true,
+      maxReconnectAttempts: options?.maxReconnectAttempts ?? 10
     };
   }
   /** Current room ID (null if not in a room) */
@@ -314,23 +328,34 @@ var Sync = class {
    * @param options - Join options
    */
   async join(roomId, options) {
-    if (this._roomId) {
+    if (this._roomId && !this.isReconnecting) {
       await this.leave();
     }
     this._roomId = roomId;
+    this.lastJoinOptions = options;
+    this.reconnectAttempts = 0;
     await this.connectWebSocket(roomId, options);
     this.startSyncLoop();
+    this.startInterpolationLoop();
   }
   /**
    * Leave the current room
    */
   async leave() {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+    this.isReconnecting = false;
     this.stopSyncLoop();
+    this.stopInterpolationLoop();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
     }
     this.clearRemotePlayers();
+    this.snapshots.clear();
+    this.jitterQueue = [];
     this._roomId = null;
   }
   /**
@@ -424,6 +449,9 @@ var Sync = class {
       this.ws.onclose = () => {
         this.stopSyncLoop();
         this.emit("disconnected");
+        if (this.options.autoReconnect && this._roomId && !this.isReconnecting) {
+          this.attemptReconnect();
+        }
       };
       this.ws.onmessage = (event) => {
         try {
@@ -463,15 +491,43 @@ var Sync = class {
     }
   }
   applyPlayerState(playerId, playerState) {
+    if (this.options.interpolate && this.options.jitterBuffer > 0) {
+      this.jitterQueue.push({
+        deliverAt: Date.now() + this.options.jitterBuffer,
+        playerId,
+        state: { ...playerState }
+      });
+    } else if (this.options.interpolate) {
+      this.addSnapshot(playerId, playerState);
+    } else {
+      this.applyStateDirect(playerId, playerState);
+    }
+  }
+  addSnapshot(playerId, playerState) {
+    const isNewPlayer = !this.snapshots.has(playerId);
+    if (isNewPlayer) {
+      this.snapshots.set(playerId, []);
+    }
+    const playerSnapshots = this.snapshots.get(playerId);
+    playerSnapshots.push({
+      time: Date.now(),
+      state: { ...playerState }
+    });
+    while (playerSnapshots.length > 10) {
+      playerSnapshots.shift();
+    }
+    const playersKey = this.findPlayersKey();
+    if (playersKey) {
+      const players = this.state[playersKey];
+      if (isNewPlayer || !players[playerId]) {
+        players[playerId] = { ...playerState };
+      }
+    }
+  }
+  applyStateDirect(playerId, playerState) {
     const playersKey = this.findPlayersKey();
     if (!playersKey) return;
     const players = this.state[playersKey];
-    if (this.options.interpolate && players[playerId]) {
-      this.interpolationTargets.set(playerId, {
-        target: { ...playerState },
-        current: { ...players[playerId] }
-      });
-    }
     players[playerId] = playerState;
   }
   removePlayer(playerId) {
@@ -479,7 +535,28 @@ var Sync = class {
     if (!playersKey) return;
     const players = this.state[playersKey];
     delete players[playerId];
-    this.interpolationTargets.delete(playerId);
+    this.snapshots.delete(playerId);
+  }
+  attemptReconnect() {
+    if (this.reconnectAttempts >= this.options.maxReconnectAttempts) {
+      this.emit("error", new Error("Max reconnection attempts reached"));
+      return;
+    }
+    this.isReconnecting = true;
+    this.reconnectAttempts++;
+    const delay = Math.min(1e3 * Math.pow(2, this.reconnectAttempts - 1), 3e4);
+    this.emit("reconnecting", { attempt: this.reconnectAttempts, delay });
+    this.reconnectTimeout = setTimeout(async () => {
+      try {
+        await this.connectWebSocket(this._roomId, this.lastJoinOptions);
+        this.startSyncLoop();
+        this.isReconnecting = false;
+        this.reconnectAttempts = 0;
+        this.emit("reconnected");
+      } catch (e) {
+        this.isReconnecting = false;
+      }
+    }, delay);
   }
   clearRemotePlayers() {
     const playersKey = this.findPlayersKey();
@@ -490,7 +567,8 @@ var Sync = class {
         delete players[playerId];
       }
     }
-    this.interpolationTargets.clear();
+    this.snapshots.clear();
+    this.jitterQueue = [];
   }
   findPlayersKey() {
     const candidates = ["players", "entities", "gnomes", "users", "clients"];
@@ -511,10 +589,29 @@ var Sync = class {
     const intervalMs = 1e3 / this.options.tickRate;
     this.syncInterval = setInterval(() => {
       this.syncMyState();
-      if (this.options.interpolate) {
-        this.updateInterpolation();
-      }
     }, intervalMs);
+  }
+  startInterpolationLoop() {
+    if (this.interpolationInterval) return;
+    if (!this.options.interpolate) return;
+    this.interpolationInterval = setInterval(() => {
+      this.processJitterQueue();
+      this.updateInterpolation();
+    }, 16);
+  }
+  stopInterpolationLoop() {
+    if (this.interpolationInterval) {
+      clearInterval(this.interpolationInterval);
+      this.interpolationInterval = null;
+    }
+  }
+  processJitterQueue() {
+    const now = Date.now();
+    const ready = this.jitterQueue.filter((item) => item.deliverAt <= now);
+    this.jitterQueue = this.jitterQueue.filter((item) => item.deliverAt > now);
+    for (const item of ready) {
+      this.addSnapshot(item.playerId, item.state);
+    }
   }
   stopSyncLoop() {
     if (this.syncInterval) {
@@ -541,16 +638,41 @@ var Sync = class {
     const playersKey = this.findPlayersKey();
     if (!playersKey) return;
     const players = this.state[playersKey];
-    const lerpFactor = 0.2;
-    for (const [playerId, interp] of this.interpolationTargets) {
+    const renderTime = Date.now() - this.options.interpolationDelay;
+    for (const [playerId, playerSnapshots] of this.snapshots) {
+      if (playerId === this.myId) continue;
       const player = players[playerId];
       if (!player) continue;
-      for (const [key, targetValue] of Object.entries(interp.target)) {
-        if (typeof targetValue === "number" && typeof interp.current[key] === "number") {
-          const current = interp.current[key];
-          const newValue = current + (targetValue - current) * lerpFactor;
-          interp.current[key] = newValue;
-          player[key] = newValue;
+      let before = null;
+      let after = null;
+      for (const snapshot of playerSnapshots) {
+        if (snapshot.time <= renderTime) {
+          before = snapshot;
+        } else if (!after) {
+          after = snapshot;
+        }
+      }
+      if (before && after) {
+        const total = after.time - before.time;
+        const elapsed = renderTime - before.time;
+        const alpha = total > 0 ? Math.min(1, elapsed / total) : 1;
+        this.lerpState(player, before.state, after.state, alpha);
+      } else if (before) {
+        this.lerpState(player, player, before.state, 0.3);
+      } else if (after) {
+        this.lerpState(player, player, after.state, 0.3);
+      }
+    }
+  }
+  lerpState(target, from, to, alpha) {
+    for (const key of Object.keys(to)) {
+      const fromVal = from[key];
+      const toVal = to[key];
+      if (typeof fromVal === "number" && typeof toVal === "number") {
+        target[key] = fromVal + (toVal - fromVal) * alpha;
+      } else {
+        if (alpha > 0.5) {
+          target[key] = toVal;
         }
       }
     }

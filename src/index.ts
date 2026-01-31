@@ -547,6 +547,16 @@ export class Sync<T extends Record<string, unknown>> {
   get connected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN
   }
+  
+  /** Number of players in the current room */
+  get playerCount(): number {
+    return this._playerCount
+  }
+  
+  /** Current latency to server in milliseconds */
+  get latency(): number {
+    return this._latency
+  }
 
   private config: Required<WatchtowerConfig>
   private options: Required<SyncOptions>
@@ -561,13 +571,20 @@ export class Sync<T extends Record<string, unknown>> {
   private snapshots: Map<string, Array<{ time: number, state: Record<string, unknown> }>> = new Map()
   
   // Jitter buffer: queue incoming updates before applying
-  private jitterQueue: Array<{ deliverAt: number, playerId: string, state: Record<string, unknown> }> = []
+  private jitterQueue: Array<{ deliverAt: number, playerId: string, state: Record<string, unknown>, timestamp?: number }> = []
   
   // Auto-reconnect state
   private reconnectAttempts: number = 0
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null
   private lastJoinOptions: JoinOptions | undefined = undefined
   private isReconnecting: boolean = false
+  
+  // Server time sync and metrics
+  private serverTimeOffset: number = 0  // Local time - server time
+  private _playerCount: number = 1
+  private _latency: number = 0
+  private pingStartTime: number = 0
+  private pingInterval: ReturnType<typeof setInterval> | null = null
 
   constructor(state: T, config: Required<WatchtowerConfig>, options?: SyncOptions) {
     this.state = state
@@ -766,24 +783,40 @@ export class Sync<T extends Record<string, unknown>> {
   }
 
   private handleMessage(data: any) {
+    // Update server time offset if server provides timestamp
+    if (data.serverTime) {
+      this.serverTimeOffset = Date.now() - data.serverTime
+    }
+    
     switch (data.type) {
+      case 'welcome':
+        // Initial connection info from server
+        if (data.state) {
+          this.applyFullState(data.state)
+        }
+        this._playerCount = data.playerCount || 1
+        this.emit('welcome', { playerCount: data.playerCount, tick: data.tick })
+        break
+        
       case 'full_state':
-        // Late joiner - receive full state from server
+        // Late joiner - receive full state from server (legacy)
         this.applyFullState(data.state)
         break
 
       case 'state':
-        // Another player's state update
-        this.applyPlayerState(data.playerId, data.data)
+        // Another player's state update - use server timestamp for interpolation
+        this.applyPlayerState(data.playerId, data.data, data.serverTime)
         break
 
       case 'join':
         // Player joined - they'll send their state soon
+        this._playerCount = data.playerCount || (this._playerCount + 1)
         this.emit('join', data.playerId)
         break
 
       case 'leave':
         // Player left - remove from state
+        this._playerCount = data.playerCount || Math.max(1, this._playerCount - 1)
         this.removePlayer(data.playerId)
         this.emit('leave', data.playerId)
         break
@@ -791,6 +824,14 @@ export class Sync<T extends Record<string, unknown>> {
       case 'message':
         // Broadcast message from another player
         this.emit('message', data.from, data.data)
+        break
+        
+      case 'pong':
+        // Latency measurement
+        if (this.pingStartTime) {
+          this._latency = Date.now() - this.pingStartTime
+          this._playerCount = data.playerCount || this._playerCount
+        }
         break
     }
   }
@@ -804,24 +845,28 @@ export class Sync<T extends Record<string, unknown>> {
     }
   }
 
-  private applyPlayerState(playerId: string, playerState: Record<string, unknown>) {
+  private applyPlayerState(playerId: string, playerState: Record<string, unknown>, serverTime?: number) {
+    // Convert server time to local time if provided
+    const timestamp = serverTime ? (serverTime + this.serverTimeOffset) : Date.now()
+    
     if (this.options.interpolate && this.options.jitterBuffer > 0) {
       // Queue the update for jitter buffering
       this.jitterQueue.push({
-        deliverAt: Date.now() + this.options.jitterBuffer,
+        deliverAt: timestamp + this.options.jitterBuffer,
         playerId,
-        state: { ...playerState }
+        state: { ...playerState },
+        timestamp
       })
     } else if (this.options.interpolate) {
       // No jitter buffer, but still use snapshots for interpolation
-      this.addSnapshot(playerId, playerState)
+      this.addSnapshot(playerId, playerState, timestamp)
     } else {
       // No interpolation - apply directly
       this.applyStateDirect(playerId, playerState)
     }
   }
   
-  private addSnapshot(playerId: string, playerState: Record<string, unknown>) {
+  private addSnapshot(playerId: string, playerState: Record<string, unknown>, timestamp?: number) {
     const isNewPlayer = !this.snapshots.has(playerId)
     
     if (isNewPlayer) {
@@ -830,7 +875,7 @@ export class Sync<T extends Record<string, unknown>> {
     
     const playerSnapshots = this.snapshots.get(playerId)!
     playerSnapshots.push({
-      time: Date.now(),
+      time: timestamp || Date.now(),
       state: { ...playerState }
     })
     
@@ -946,12 +991,28 @@ export class Sync<T extends Record<string, unknown>> {
       this.processJitterQueue()
       this.updateInterpolation()
     }, 16) // ~60fps
+    
+    // Start ping interval for latency measurement (every 2 seconds)
+    this.pingInterval = setInterval(() => {
+      this.measureLatency()
+    }, 2000)
+  }
+  
+  private measureLatency() {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.pingStartTime = Date.now()
+      this.ws.send(JSON.stringify({ type: 'ping' }))
+    }
   }
   
   private stopInterpolationLoop() {
     if (this.interpolationInterval) {
       clearInterval(this.interpolationInterval)
       this.interpolationInterval = null
+    }
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval)
+      this.pingInterval = null
     }
   }
   
@@ -961,7 +1022,7 @@ export class Sync<T extends Record<string, unknown>> {
     this.jitterQueue = this.jitterQueue.filter(item => item.deliverAt > now)
     
     for (const item of ready) {
-      this.addSnapshot(item.playerId, item.state)
+      this.addSnapshot(item.playerId, item.state, item.timestamp)
     }
   }
 

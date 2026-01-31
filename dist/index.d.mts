@@ -211,6 +211,14 @@ interface SyncOptions {
     tickRate?: number;
     /** Enable interpolation for remote entities (default: true) */
     interpolate?: boolean;
+    /** Interpolation delay in ms - how far "in the past" to render others (default: 100) */
+    interpolationDelay?: number;
+    /** Jitter buffer size in ms - smooths network variance (default: 50) */
+    jitterBuffer?: number;
+    /** Enable auto-reconnection on disconnect (default: true) */
+    autoReconnect?: boolean;
+    /** Max reconnection attempts (default: 10) */
+    maxReconnectAttempts?: number;
 }
 interface JoinOptions {
     /** Create room if it doesn't exist */
@@ -268,9 +276,15 @@ declare class Sync<T extends Record<string, unknown>> {
     private _roomId;
     private ws;
     private syncInterval;
+    private interpolationInterval;
     private lastSentState;
-    private interpolationTargets;
     private listeners;
+    private snapshots;
+    private jitterQueue;
+    private reconnectAttempts;
+    private reconnectTimeout;
+    private lastJoinOptions;
+    private isReconnecting;
     constructor(state: T, config: Required<WatchtowerConfig>, options?: SyncOptions);
     /**
      * Join a room - your state will sync with everyone in this room
@@ -303,7 +317,7 @@ declare class Sync<T extends Record<string, unknown>> {
     /**
      * Subscribe to sync events
      */
-    on(event: 'join' | 'leave' | 'error' | 'connected' | 'disconnected' | 'message', callback: Function): void;
+    on(event: 'join' | 'leave' | 'error' | 'connected' | 'disconnected' | 'reconnecting' | 'reconnected' | 'message', callback: Function): void;
     /**
      * Unsubscribe from sync events
      */
@@ -313,13 +327,20 @@ declare class Sync<T extends Record<string, unknown>> {
     private handleMessage;
     private applyFullState;
     private applyPlayerState;
+    private addSnapshot;
+    private applyStateDirect;
     private removePlayer;
+    private attemptReconnect;
     private clearRemotePlayers;
     private findPlayersKey;
     private startSyncLoop;
+    private startInterpolationLoop;
+    private stopInterpolationLoop;
+    private processJitterQueue;
     private stopSyncLoop;
     private syncMyState;
     private updateInterpolation;
+    private lerpState;
     private generateRoomCode;
     private getHeaders;
 }
