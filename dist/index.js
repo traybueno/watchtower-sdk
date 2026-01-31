@@ -293,6 +293,8 @@ var Sync = class {
     this.listeners = /* @__PURE__ */ new Map();
     // Snapshot-based interpolation: store timestamped snapshots per player
     this.snapshots = /* @__PURE__ */ new Map();
+    // Lerp-based smoothing: store target positions per player (for 'lerp' mode)
+    this.lerpTargets = /* @__PURE__ */ new Map();
     // Jitter buffer: queue incoming updates before applying
     this.jitterQueue = [];
     // Auto-reconnect state
@@ -310,12 +312,20 @@ var Sync = class {
     this.state = state;
     this.myId = config.playerId;
     this.config = config;
+    let smoothing = options?.smoothing ?? "lerp";
+    if (options?.interpolate === false) {
+      smoothing = "none";
+    } else if (options?.interpolate === true && !options?.smoothing) {
+      smoothing = "lerp";
+    }
     this.options = {
       tickRate: options?.tickRate ?? 20,
-      interpolate: options?.interpolate ?? true,
+      smoothing,
+      lerpFactor: options?.lerpFactor ?? 0.15,
+      interpolate: smoothing !== "none",
+      // Legacy compat
       interpolationDelay: options?.interpolationDelay ?? 100,
       jitterBuffer: options?.jitterBuffer ?? 0,
-      // 0 = immediate, set to 50+ for smoothing
       autoReconnect: options?.autoReconnect ?? true,
       maxReconnectAttempts: options?.maxReconnectAttempts ?? 10
     };
@@ -525,17 +535,37 @@ var Sync = class {
   }
   applyPlayerState(playerId, playerState, serverTime) {
     const timestamp = serverTime ? serverTime + this.serverTimeOffset : Date.now();
-    if (this.options.interpolate && this.options.jitterBuffer > 0) {
-      this.jitterQueue.push({
-        deliverAt: timestamp + this.options.jitterBuffer,
-        playerId,
-        state: { ...playerState },
-        timestamp
-      });
-    } else if (this.options.interpolate) {
-      this.addSnapshot(playerId, playerState, timestamp);
-    } else {
-      this.applyStateDirect(playerId, playerState);
+    switch (this.options.smoothing) {
+      case "lerp":
+        this.setLerpTarget(playerId, playerState);
+        break;
+      case "interpolate":
+        if (this.options.jitterBuffer > 0) {
+          this.jitterQueue.push({
+            deliverAt: timestamp + this.options.jitterBuffer,
+            playerId,
+            state: { ...playerState },
+            timestamp
+          });
+        } else {
+          this.addSnapshot(playerId, playerState, timestamp);
+        }
+        break;
+      case "none":
+      default:
+        this.applyStateDirect(playerId, playerState);
+        break;
+    }
+  }
+  setLerpTarget(playerId, playerState) {
+    const isNewPlayer = !this.lerpTargets.has(playerId);
+    this.lerpTargets.set(playerId, { ...playerState });
+    const playersKey = this.findPlayersKey();
+    if (playersKey) {
+      const players = this.state[playersKey];
+      if (isNewPlayer || !players[playerId]) {
+        players[playerId] = { ...playerState };
+      }
     }
   }
   addSnapshot(playerId, playerState, timestamp) {
@@ -571,6 +601,7 @@ var Sync = class {
     const players = this.state[playersKey];
     delete players[playerId];
     this.snapshots.delete(playerId);
+    this.lerpTargets.delete(playerId);
   }
   attemptReconnect() {
     if (this.reconnectAttempts >= this.options.maxReconnectAttempts) {
@@ -603,6 +634,7 @@ var Sync = class {
       }
     }
     this.snapshots.clear();
+    this.lerpTargets.clear();
     this.jitterQueue = [];
   }
   findPlayersKey() {
@@ -628,14 +660,42 @@ var Sync = class {
   }
   startInterpolationLoop() {
     if (this.interpolationInterval) return;
-    if (!this.options.interpolate) return;
+    if (this.options.smoothing === "none") return;
     this.interpolationInterval = setInterval(() => {
-      this.processJitterQueue();
-      this.updateInterpolation();
+      if (this.options.smoothing === "lerp") {
+        this.updateLerp();
+      } else if (this.options.smoothing === "interpolate") {
+        this.processJitterQueue();
+        this.updateInterpolation();
+      }
     }, 16);
     this.pingInterval = setInterval(() => {
       this.measureLatency();
     }, 2e3);
+  }
+  /**
+   * Frame-based lerping (gnome-chat style)
+   * Lerps each remote player's position toward their target by lerpFactor each frame.
+   * Simple, zero latency, great for casual games.
+   */
+  updateLerp() {
+    const playersKey = this.findPlayersKey();
+    if (!playersKey) return;
+    const players = this.state[playersKey];
+    const lerpFactor = this.options.lerpFactor;
+    for (const [playerId, target] of this.lerpTargets) {
+      if (playerId === this.myId) continue;
+      const player = players[playerId];
+      if (!player) continue;
+      for (const [key, targetValue] of Object.entries(target)) {
+        if (typeof targetValue === "number" && typeof player[key] === "number") {
+          const current = player[key];
+          player[key] = current + (targetValue - current) * lerpFactor;
+        } else if (typeof targetValue !== "number") {
+          player[key] = targetValue;
+        }
+      }
+    }
   }
   measureLatency() {
     if (this.ws?.readyState === WebSocket.OPEN) {

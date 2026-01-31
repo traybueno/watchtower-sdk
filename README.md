@@ -134,34 +134,45 @@ const sync = wt.sync(state, {
 
 ## Smoothing Options
 
-The SDK automatically smooths remote player movement. Configure based on your game type:
+The SDK automatically smooths remote player movement using frame-based lerping (like gnome-chat).
 
 ```typescript
 const sync = wt.sync(state, {
+  // Smoothing mode (default: 'lerp')
+  smoothing: 'lerp',         // 'lerp' | 'interpolate' | 'none'
+  
+  // Lerp settings (for smoothing: 'lerp')
+  lerpFactor: 0.15,          // 0.1 = smooth, 0.3 = snappy (default: 0.15)
+  
+  // Interpolation settings (for smoothing: 'interpolate')
+  interpolationDelay: 100,   // Render others Xms in the past
+  jitterBuffer: 50,          // Buffer packets Xms to smooth delivery
+  
   // Core settings
   tickRate: 20,              // Updates per second (default: 20)
-  interpolate: true,         // Smooth remote movement (default: true)
-  
-  // Smoothing tuning
-  interpolationDelay: 100,   // Render others Xms in the past (default: 100)
-  jitterBuffer: 50,          // Buffer packets Xms to smooth delivery (default: 0)
-  
-  // Connection handling
   autoReconnect: true,       // Auto-reconnect on disconnect (default: true)
   maxReconnectAttempts: 10   // Give up after X attempts (default: 10)
 })
 ```
 
-### Recommended Presets
+### Smoothing Modes
 
-| Game Type | interpolationDelay | jitterBuffer | Notes |
-|-----------|-------------------|--------------|-------|
-| Casual (cursor party) | 100ms | 50ms | Buttery smooth, slight delay |
-| Action (platformer) | 50ms | 25ms | Responsive, still smooth |
-| Fast (shooter) | 40ms | 20ms | Very responsive |
-| Turn-based | 0ms | 0ms | Instant, no movement to smooth |
+| Mode | Latency | Best For |
+|------|---------|----------|
+| `lerp` (default) | 0ms | Casual games, cursor parties, .io games |
+| `interpolate` | 50-100ms | Competitive, shooters (more accurate) |
+| `none` | 0ms | Turn-based, chat (no movement) |
 
-**Why the delay?** The SDK renders other players slightly "in the past" using server timestamps. This allows it to interpolate between known positions instead of guessing. 100ms is imperceptible for casual games but makes movement silky smooth.
+### Lerp Factor Guide
+
+| Value | Feel | Use Case |
+|-------|------|----------|
+| 0.1 | Very smooth, floaty | Cursors, casual |
+| 0.15 | Balanced (default) | Most games |
+| 0.25 | Snappy | Action games |
+| 0.3+ | Very responsive | Fast-paced |
+
+**How lerp works:** Every frame (60fps), remote players move 15% toward their target position. This creates natural smooth catch-up with zero added latency.
 
 ---
 
@@ -320,15 +331,75 @@ loop()
 
 ---
 
+## Private State
+
+Need to hide state from other players? Cards in hand, fog of war, secret roles?
+
+Any field starting with `_` is **private** — only you see it.
+
+```typescript
+state.players[sync.myId] = {
+  // Public - everyone sees
+  x: 100,
+  y: 200,
+  cardCount: 5,
+  
+  // Private - only you see
+  _hand: ['Ace', 'King', 'Queen', '7', '2'],
+  _role: 'impostor'
+}
+```
+
+Other players receive:
+```typescript
+{
+  x: 100,
+  y: 200,
+  cardCount: 5
+  // _hand and _role are stripped!
+}
+```
+
+### Use Cases
+
+**Card Games:**
+```typescript
+state.players[sync.myId] = {
+  name: 'Player1',
+  cardCount: state.players[sync.myId]._hand.length,
+  _hand: ['Ace', 'King']  // Private!
+}
+```
+
+**Hidden Roles (Among Us):**
+```typescript
+state.players[sync.myId] = {
+  x, y, alive: true,
+  _role: 'impostor',  // Only I know
+  _canKill: true
+}
+```
+
+**Fog of War:**
+```typescript
+state.players[sync.myId] = {
+  x, y,
+  _visibleEnemies: ['enemy1', 'enemy3'],  // Only I know what I can see
+  _lastKnownPositions: { ... }
+}
+```
+
+---
+
 ## Best Practices
 
 1. **Keep state flat.** Nested objects sync fine, but flat is faster to diff.
 
 2. **Use the `players` key.** The SDK auto-detects `players`, `entities`, `users`, or `clients`.
 
-3. **Don't store secrets in state.** Everyone sees everything. Use server-side validation for game logic.
+3. **Use `_` prefix for secrets.** Any field starting with `_` is hidden from other players.
 
-4. **Let the SDK interpolate.** Don't add your own smoothing on top — it'll fight the SDK.
+4. **Let the SDK smooth.** Don't add your own lerping — it'll fight the SDK.
 
 5. **Test with "Open another tab".** Easiest way to see multiplayer working.
 

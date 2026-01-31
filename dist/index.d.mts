@@ -209,11 +209,20 @@ declare class Room {
 interface SyncOptions {
     /** Updates per second (default: 20) */
     tickRate?: number;
-    /** Enable interpolation for remote entities (default: true) */
+    /**
+     * Smoothing mode for remote players (default: 'lerp')
+     * - 'lerp': Frame-based lerping toward latest position. Zero latency, simple, great for casual games.
+     * - 'interpolate': Time-based snapshot interpolation. Adds latency but more accurate for competitive games.
+     * - 'none': No smoothing, positions snap immediately.
+     */
+    smoothing?: 'lerp' | 'interpolate' | 'none';
+    /** Lerp factor - how fast to catch up to target (default: 0.15). Only used in 'lerp' mode. */
+    lerpFactor?: number;
+    /** @deprecated Use smoothing: 'interpolate' instead */
     interpolate?: boolean;
-    /** Interpolation delay in ms - how far "in the past" to render others (default: 100) */
+    /** Interpolation delay in ms - how far "in the past" to render others (default: 100). Only used in 'interpolate' mode. */
     interpolationDelay?: number;
-    /** Jitter buffer size in ms - smooths network variance (default: 50) */
+    /** Jitter buffer size in ms - smooths network variance (default: 0). Only used in 'interpolate' mode. */
     jitterBuffer?: number;
     /** Enable auto-reconnection on disconnect (default: true) */
     autoReconnect?: boolean;
@@ -284,6 +293,7 @@ declare class Sync<T extends Record<string, unknown>> {
     private lastSentState;
     private listeners;
     private snapshots;
+    private lerpTargets;
     private jitterQueue;
     private reconnectAttempts;
     private reconnectTimeout;
@@ -336,6 +346,7 @@ declare class Sync<T extends Record<string, unknown>> {
     private handleMessage;
     private applyFullState;
     private applyPlayerState;
+    private setLerpTarget;
     private addSnapshot;
     private applyStateDirect;
     private removePlayer;
@@ -344,6 +355,12 @@ declare class Sync<T extends Record<string, unknown>> {
     private findPlayersKey;
     private startSyncLoop;
     private startInterpolationLoop;
+    /**
+     * Frame-based lerping (gnome-chat style)
+     * Lerps each remote player's position toward their target by lerpFactor each frame.
+     * Simple, zero latency, great for casual games.
+     */
+    private updateLerp;
     private measureLatency;
     private stopInterpolationLoop;
     private processJitterQueue;
