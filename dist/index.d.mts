@@ -271,6 +271,10 @@ declare class Sync<T extends Record<string, unknown>> {
     get roomId(): string | null;
     /** Whether currently connected to a room */
     get connected(): boolean;
+    /** Number of players in the current room */
+    get playerCount(): number;
+    /** Current latency to server in milliseconds */
+    get latency(): number;
     private config;
     private options;
     private _roomId;
@@ -285,6 +289,11 @@ declare class Sync<T extends Record<string, unknown>> {
     private reconnectTimeout;
     private lastJoinOptions;
     private isReconnecting;
+    private serverTimeOffset;
+    private _playerCount;
+    private _latency;
+    private pingStartTime;
+    private pingInterval;
     constructor(state: T, config: Required<WatchtowerConfig>, options?: SyncOptions);
     /**
      * Join a room - your state will sync with everyone in this room
@@ -335,6 +344,7 @@ declare class Sync<T extends Record<string, unknown>> {
     private findPlayersKey;
     private startSyncLoop;
     private startInterpolationLoop;
+    private measureLatency;
     private stopInterpolationLoop;
     private processJitterQueue;
     private stopSyncLoop;

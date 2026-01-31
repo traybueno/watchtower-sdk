@@ -300,6 +300,13 @@ var Sync = class {
     this.reconnectTimeout = null;
     this.lastJoinOptions = void 0;
     this.isReconnecting = false;
+    // Server time sync and metrics
+    this.serverTimeOffset = 0;
+    // Local time - server time
+    this._playerCount = 1;
+    this._latency = 0;
+    this.pingStartTime = 0;
+    this.pingInterval = null;
     this.state = state;
     this.myId = config.playerId;
     this.config = config;
@@ -320,6 +327,14 @@ var Sync = class {
   /** Whether currently connected to a room */
   get connected() {
     return this.ws?.readyState === WebSocket.OPEN;
+  }
+  /** Number of players in the current room */
+  get playerCount() {
+    return this._playerCount;
+  }
+  /** Current latency to server in milliseconds */
+  get latency() {
+    return this._latency;
   }
   /**
    * Join a room - your state will sync with everyone in this room
@@ -464,22 +479,40 @@ var Sync = class {
     });
   }
   handleMessage(data) {
+    if (data.serverTime) {
+      this.serverTimeOffset = Date.now() - data.serverTime;
+    }
     switch (data.type) {
+      case "welcome":
+        if (data.state) {
+          this.applyFullState(data.state);
+        }
+        this._playerCount = data.playerCount || 1;
+        this.emit("welcome", { playerCount: data.playerCount, tick: data.tick });
+        break;
       case "full_state":
         this.applyFullState(data.state);
         break;
       case "state":
-        this.applyPlayerState(data.playerId, data.data);
+        this.applyPlayerState(data.playerId, data.data, data.serverTime);
         break;
       case "join":
+        this._playerCount = data.playerCount || this._playerCount + 1;
         this.emit("join", data.playerId);
         break;
       case "leave":
+        this._playerCount = data.playerCount || Math.max(1, this._playerCount - 1);
         this.removePlayer(data.playerId);
         this.emit("leave", data.playerId);
         break;
       case "message":
         this.emit("message", data.from, data.data);
+        break;
+      case "pong":
+        if (this.pingStartTime) {
+          this._latency = Date.now() - this.pingStartTime;
+          this._playerCount = data.playerCount || this._playerCount;
+        }
         break;
     }
   }
@@ -490,27 +523,29 @@ var Sync = class {
       }
     }
   }
-  applyPlayerState(playerId, playerState) {
+  applyPlayerState(playerId, playerState, serverTime) {
+    const timestamp = serverTime ? serverTime + this.serverTimeOffset : Date.now();
     if (this.options.interpolate && this.options.jitterBuffer > 0) {
       this.jitterQueue.push({
-        deliverAt: Date.now() + this.options.jitterBuffer,
+        deliverAt: timestamp + this.options.jitterBuffer,
         playerId,
-        state: { ...playerState }
+        state: { ...playerState },
+        timestamp
       });
     } else if (this.options.interpolate) {
-      this.addSnapshot(playerId, playerState);
+      this.addSnapshot(playerId, playerState, timestamp);
     } else {
       this.applyStateDirect(playerId, playerState);
     }
   }
-  addSnapshot(playerId, playerState) {
+  addSnapshot(playerId, playerState, timestamp) {
     const isNewPlayer = !this.snapshots.has(playerId);
     if (isNewPlayer) {
       this.snapshots.set(playerId, []);
     }
     const playerSnapshots = this.snapshots.get(playerId);
     playerSnapshots.push({
-      time: Date.now(),
+      time: timestamp || Date.now(),
       state: { ...playerState }
     });
     while (playerSnapshots.length > 10) {
@@ -598,11 +633,24 @@ var Sync = class {
       this.processJitterQueue();
       this.updateInterpolation();
     }, 16);
+    this.pingInterval = setInterval(() => {
+      this.measureLatency();
+    }, 2e3);
+  }
+  measureLatency() {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.pingStartTime = Date.now();
+      this.ws.send(JSON.stringify({ type: "ping" }));
+    }
   }
   stopInterpolationLoop() {
     if (this.interpolationInterval) {
       clearInterval(this.interpolationInterval);
       this.interpolationInterval = null;
+    }
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
     }
   }
   processJitterQueue() {
@@ -610,7 +658,7 @@ var Sync = class {
     const ready = this.jitterQueue.filter((item) => item.deliverAt <= now);
     this.jitterQueue = this.jitterQueue.filter((item) => item.deliverAt > now);
     for (const item of ready) {
-      this.addSnapshot(item.playerId, item.state);
+      this.addSnapshot(item.playerId, item.state, item.timestamp);
     }
   }
   stopSyncLoop() {
