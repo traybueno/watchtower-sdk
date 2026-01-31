@@ -475,11 +475,20 @@ export class Room {
 export interface SyncOptions {
   /** Updates per second (default: 20) */
   tickRate?: number
-  /** Enable interpolation for remote entities (default: true) */
+  /** 
+   * Smoothing mode for remote players (default: 'lerp')
+   * - 'lerp': Frame-based lerping toward latest position. Zero latency, simple, great for casual games.
+   * - 'interpolate': Time-based snapshot interpolation. Adds latency but more accurate for competitive games.
+   * - 'none': No smoothing, positions snap immediately.
+   */
+  smoothing?: 'lerp' | 'interpolate' | 'none'
+  /** Lerp factor - how fast to catch up to target (default: 0.15). Only used in 'lerp' mode. */
+  lerpFactor?: number
+  /** @deprecated Use smoothing: 'interpolate' instead */
   interpolate?: boolean
-  /** Interpolation delay in ms - how far "in the past" to render others (default: 100) */
+  /** Interpolation delay in ms - how far "in the past" to render others (default: 100). Only used in 'interpolate' mode. */
   interpolationDelay?: number
-  /** Jitter buffer size in ms - smooths network variance (default: 50) */
+  /** Jitter buffer size in ms - smooths network variance (default: 0). Only used in 'interpolate' mode. */
   jitterBuffer?: number
   /** Enable auto-reconnection on disconnect (default: true) */
   autoReconnect?: boolean
@@ -570,6 +579,9 @@ export class Sync<T extends Record<string, unknown>> {
   // Snapshot-based interpolation: store timestamped snapshots per player
   private snapshots: Map<string, Array<{ time: number, state: Record<string, unknown> }>> = new Map()
   
+  // Lerp-based smoothing: store target positions per player (for 'lerp' mode)
+  private lerpTargets: Map<string, Record<string, unknown>> = new Map()
+  
   // Jitter buffer: queue incoming updates before applying
   private jitterQueue: Array<{ deliverAt: number, playerId: string, state: Record<string, unknown>, timestamp?: number }> = []
   
@@ -590,11 +602,23 @@ export class Sync<T extends Record<string, unknown>> {
     this.state = state
     this.myId = config.playerId
     this.config = config
+    
+    // Handle legacy 'interpolate' option
+    let smoothing: 'lerp' | 'interpolate' | 'none' = options?.smoothing ?? 'lerp'
+    if (options?.interpolate === false) {
+      smoothing = 'none'
+    } else if (options?.interpolate === true && !options?.smoothing) {
+      // Legacy: interpolate: true without smoothing specified = use lerp (new default)
+      smoothing = 'lerp'
+    }
+    
     this.options = {
       tickRate: options?.tickRate ?? 20,
-      interpolate: options?.interpolate ?? true,
+      smoothing,
+      lerpFactor: options?.lerpFactor ?? 0.15,
+      interpolate: smoothing !== 'none',  // Legacy compat
       interpolationDelay: options?.interpolationDelay ?? 100,
-      jitterBuffer: options?.jitterBuffer ?? 0, // 0 = immediate, set to 50+ for smoothing
+      jitterBuffer: options?.jitterBuffer ?? 0,
       autoReconnect: options?.autoReconnect ?? true,
       maxReconnectAttempts: options?.maxReconnectAttempts ?? 10
     }
@@ -849,20 +873,50 @@ export class Sync<T extends Record<string, unknown>> {
     // Convert server time to local time if provided
     const timestamp = serverTime ? (serverTime + this.serverTimeOffset) : Date.now()
     
-    if (this.options.interpolate && this.options.jitterBuffer > 0) {
-      // Queue the update for jitter buffering
-      this.jitterQueue.push({
-        deliverAt: timestamp + this.options.jitterBuffer,
-        playerId,
-        state: { ...playerState },
-        timestamp
-      })
-    } else if (this.options.interpolate) {
-      // No jitter buffer, but still use snapshots for interpolation
-      this.addSnapshot(playerId, playerState, timestamp)
-    } else {
-      // No interpolation - apply directly
-      this.applyStateDirect(playerId, playerState)
+    switch (this.options.smoothing) {
+      case 'lerp':
+        // Store as lerp target - will be lerped toward in the interpolation loop
+        this.setLerpTarget(playerId, playerState)
+        break
+        
+      case 'interpolate':
+        if (this.options.jitterBuffer > 0) {
+          // Queue the update for jitter buffering
+          this.jitterQueue.push({
+            deliverAt: timestamp + this.options.jitterBuffer,
+            playerId,
+            state: { ...playerState },
+            timestamp
+          })
+        } else {
+          // No jitter buffer, use snapshots for interpolation
+          this.addSnapshot(playerId, playerState, timestamp)
+        }
+        break
+        
+      case 'none':
+      default:
+        // No smoothing - apply directly
+        this.applyStateDirect(playerId, playerState)
+        break
+    }
+  }
+  
+  private setLerpTarget(playerId: string, playerState: Record<string, unknown>) {
+    const isNewPlayer = !this.lerpTargets.has(playerId)
+    
+    // Store the target
+    this.lerpTargets.set(playerId, { ...playerState })
+    
+    // Ensure player exists in state
+    const playersKey = this.findPlayersKey()
+    if (playersKey) {
+      const players = this.state[playersKey] as Record<string, unknown>
+      if (isNewPlayer || !players[playerId]) {
+        // New player - set initial position immediately (no lerping from 0,0)
+        players[playerId] = { ...playerState }
+      }
+      // Existing players will be lerped toward target in updateLerp()
     }
   }
   
@@ -911,6 +965,7 @@ export class Sync<T extends Record<string, unknown>> {
     const players = this.state[playersKey] as Record<string, unknown>
     delete players[playerId]
     this.snapshots.delete(playerId)
+    this.lerpTargets.delete(playerId)
   }
   
   private attemptReconnect() {
@@ -952,6 +1007,7 @@ export class Sync<T extends Record<string, unknown>> {
       }
     }
     this.snapshots.clear()
+    this.lerpTargets.clear()
     this.jitterQueue = []
   }
 
@@ -984,18 +1040,54 @@ export class Sync<T extends Record<string, unknown>> {
   
   private startInterpolationLoop() {
     if (this.interpolationInterval) return
-    if (!this.options.interpolate) return
+    if (this.options.smoothing === 'none') return
     
     // Run at 60fps for smooth visuals
     this.interpolationInterval = setInterval(() => {
-      this.processJitterQueue()
-      this.updateInterpolation()
+      if (this.options.smoothing === 'lerp') {
+        this.updateLerp()
+      } else if (this.options.smoothing === 'interpolate') {
+        this.processJitterQueue()
+        this.updateInterpolation()
+      }
     }, 16) // ~60fps
     
     // Start ping interval for latency measurement (every 2 seconds)
     this.pingInterval = setInterval(() => {
       this.measureLatency()
     }, 2000)
+  }
+  
+  /**
+   * Frame-based lerping (gnome-chat style)
+   * Lerps each remote player's position toward their target by lerpFactor each frame.
+   * Simple, zero latency, great for casual games.
+   */
+  private updateLerp() {
+    const playersKey = this.findPlayersKey()
+    if (!playersKey) return
+
+    const players = this.state[playersKey] as Record<string, Record<string, unknown>>
+    const lerpFactor = this.options.lerpFactor
+
+    for (const [playerId, target] of this.lerpTargets) {
+      if (playerId === this.myId) continue
+      
+      const player = players[playerId]
+      if (!player) continue
+
+      // Lerp all numeric values toward target
+      for (const [key, targetValue] of Object.entries(target)) {
+        if (typeof targetValue === 'number' && typeof player[key] === 'number') {
+          const current = player[key] as number
+          // Lerp: current + (target - current) * factor
+          player[key] = current + (targetValue - current) * lerpFactor
+        } else if (typeof targetValue !== 'number') {
+          // Non-numeric values: apply directly
+          player[key] = targetValue
+        }
+      }
+    }
   }
   
   private measureLatency() {
