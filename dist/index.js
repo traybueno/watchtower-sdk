@@ -21,440 +21,42 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 var index_exports = {};
 __export(index_exports, {
   Room: () => Room,
-  Sync: () => Sync,
-  Watchtower: () => Watchtower,
+  connect: () => connect,
   default: () => index_default
 });
 module.exports = __toCommonJS(index_exports);
-var PlayerStateManager = class {
-  constructor(room, syncRateMs = 50) {
-    this._state = {};
-    this.syncInterval = null;
-    this.dirty = false;
-    this.room = room;
-    this.syncRateMs = syncRateMs;
-  }
-  /** Set player state (merged with existing) */
-  set(state) {
-    this._state = { ...this._state, ...state };
-    this.dirty = true;
-  }
-  /** Replace entire player state */
-  replace(state) {
-    this._state = state;
-    this.dirty = true;
-  }
-  /** Get current player state */
-  get() {
-    return { ...this._state };
-  }
-  /** Clear player state */
-  clear() {
-    this._state = {};
-    this.dirty = true;
-  }
-  /** Start automatic sync */
-  startSync() {
-    if (this.syncInterval) return;
-    this.syncInterval = setInterval(() => {
-      if (this.dirty) {
-        this.room["send"]({ type: "player_state", state: this._state });
-        this.dirty = false;
-      }
-    }, this.syncRateMs);
-  }
-  /** Stop automatic sync */
-  stopSync() {
-    if (this.syncInterval) {
-      clearInterval(this.syncInterval);
-      this.syncInterval = null;
-    }
-  }
-  /** Force immediate sync */
-  sync() {
-    this.room["send"]({ type: "player_state", state: this._state });
-    this.dirty = false;
-  }
-};
-var GameStateManager = class {
-  constructor(room) {
-    this._state = {};
-    this.room = room;
-  }
-  /** Set game state (host only, merged with existing) */
-  set(state) {
-    if (!this.room.isHost) {
-      console.warn("Only the host can set game state");
-      return;
-    }
-    this._state = { ...this._state, ...state };
-    this.room["send"]({ type: "game_state", state: this._state });
-  }
-  /** Replace entire game state (host only) */
-  replace(state) {
-    if (!this.room.isHost) {
-      console.warn("Only the host can set game state");
-      return;
-    }
-    this._state = state;
-    this.room["send"]({ type: "game_state", state: this._state });
-  }
-  /** Get current game state */
-  get() {
-    return { ...this._state };
-  }
-  /** Update internal state (called on sync from server) */
-  _update(state) {
-    this._state = state;
-  }
-};
 var Room = class {
-  constructor(code, config) {
+  constructor(roomId, config = {}) {
     this.ws = null;
     this.listeners = /* @__PURE__ */ new Map();
-    /** All players' current states */
-    this._players = {};
-    /** Current host ID */
+    this._players = /* @__PURE__ */ new Map();
     this._hostId = "";
-    /** Room info from initial connection */
-    this._roomInfo = null;
-    this.code = code;
-    this.config = config;
-    this.player = new PlayerStateManager(this);
-    this.state = new GameStateManager(this);
+    this._connected = false;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 10;
+    this.reconnectTimeout = null;
+    this.config = {
+      roomId,
+      gameId: config.gameId || (typeof window !== "undefined" ? window.location.hostname : "default"),
+      playerId: config.playerId || this.generatePlayerId(),
+      apiUrl: config.apiUrl || "https://watchtower-api.watchtower-host.workers.dev",
+      create: config.create ?? true,
+      name: config.name,
+      meta: config.meta
+    };
   }
-  /** Get the current host ID */
-  get hostId() {
-    return this._hostId;
-  }
-  /** Check if current player is the host */
-  get isHost() {
-    return this._hostId === this.config.playerId;
-  }
-  /** Get current player's ID */
-  get playerId() {
-    return this.config.playerId;
-  }
-  /** Get all players' states */
-  get players() {
-    return { ...this._players };
-  }
-  /** Get player count */
-  get playerCount() {
-    return Object.keys(this._players).length;
-  }
-  /** Connect to the room via WebSocket */
+  // === CONNECTION ===
   async connect() {
     return new Promise((resolve, reject) => {
       const wsUrl = this.config.apiUrl.replace("https://", "wss://").replace("http://", "ws://");
       const params = new URLSearchParams({
         playerId: this.config.playerId,
-        ...this.config.apiKey ? { apiKey: this.config.apiKey } : {}
-      });
-      const url = `${wsUrl}/v1/rooms/${this.code}/ws?${params}`;
-      this.ws = new WebSocket(url);
-      this.ws.onopen = () => {
-        this.player.startSync();
-        resolve();
-      };
-      this.ws.onerror = () => {
-        const error = new Error("WebSocket connection failed");
-        this.emit("error", error);
-        reject(error);
-      };
-      this.ws.onclose = () => {
-        this.player.stopSync();
-        this.emit("disconnected");
-      };
-      this.ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          this.handleMessage(data);
-        } catch (e) {
-          console.error("Failed to parse WebSocket message:", e);
-        }
-      };
-    });
-  }
-  handleMessage(data) {
-    switch (data.type) {
-      case "connected":
-        this._hostId = data.room.hostId;
-        this._roomInfo = data.room;
-        if (data.playerStates) {
-          this._players = data.playerStates;
-        }
-        if (data.gameState) {
-          this.state._update(data.gameState);
-        }
-        this.emit("connected", {
-          playerId: data.playerId,
-          room: data.room
-        });
-        break;
-      case "player_joined":
-        this.emit("playerJoined", data.playerId, data.playerCount);
-        break;
-      case "player_left":
-        delete this._players[data.playerId];
-        this.emit("playerLeft", data.playerId, data.playerCount);
-        this.emit("players", this._players);
-        break;
-      case "players_sync":
-        this._players = data.players;
-        this.emit("players", this._players);
-        break;
-      case "player_state_update":
-        this._players[data.playerId] = data.state;
-        this.emit("players", this._players);
-        break;
-      case "game_state_sync":
-        this.state._update(data.state);
-        this.emit("state", data.state);
-        break;
-      case "host_changed":
-        this._hostId = data.hostId;
-        this.emit("hostChanged", data.hostId);
-        break;
-      case "message":
-        this.emit("message", data.from, data.data);
-        break;
-      case "pong":
-        break;
-    }
-  }
-  /** Subscribe to room events */
-  on(event, callback) {
-    if (!this.listeners.has(event)) {
-      this.listeners.set(event, /* @__PURE__ */ new Set());
-    }
-    this.listeners.get(event).add(callback);
-  }
-  /** Unsubscribe from room events */
-  off(event, callback) {
-    this.listeners.get(event)?.delete(callback);
-  }
-  emit(event, ...args) {
-    this.listeners.get(event)?.forEach((callback) => {
-      try {
-        callback(...args);
-      } catch (e) {
-        console.error(`Error in ${event} handler:`, e);
-      }
-    });
-  }
-  /** Broadcast data to all players in the room (for one-off events) */
-  broadcast(data, excludeSelf = true) {
-    this.send({ type: "broadcast", data, excludeSelf });
-  }
-  /** Send data to a specific player */
-  sendTo(playerId, data) {
-    this.send({ type: "send", to: playerId, data });
-  }
-  /** Send a ping to measure latency */
-  ping() {
-    this.send({ type: "ping" });
-  }
-  /** Request host transfer (host only) */
-  transferHost(newHostId) {
-    if (!this.isHost) {
-      console.warn("Only the host can transfer host");
-      return;
-    }
-    this.send({ type: "transfer_host", newHostId });
-  }
-  send(data) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(data));
-    } else {
-      console.warn("WebSocket not connected");
-    }
-  }
-  /** Disconnect from the room */
-  disconnect() {
-    this.player.stopSync();
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
-  }
-  /** Check if connected */
-  get connected() {
-    return this.ws?.readyState === WebSocket.OPEN;
-  }
-};
-var Sync = class {
-  constructor(state, config, options) {
-    this._roomId = null;
-    this.ws = null;
-    this.syncInterval = null;
-    this.interpolationInterval = null;
-    this.lastSentState = "";
-    this.listeners = /* @__PURE__ */ new Map();
-    // Snapshot-based interpolation: store timestamped snapshots per player
-    this.snapshots = /* @__PURE__ */ new Map();
-    // Lerp-based smoothing: store target positions per player (for 'lerp' mode)
-    this.lerpTargets = /* @__PURE__ */ new Map();
-    // Jitter buffer: queue incoming updates before applying
-    this.jitterQueue = [];
-    // Auto-reconnect state
-    this.reconnectAttempts = 0;
-    this.reconnectTimeout = null;
-    this.lastJoinOptions = void 0;
-    this.isReconnecting = false;
-    // Server time sync and metrics
-    this.serverTimeOffset = 0;
-    // Local time - server time
-    this._playerCount = 1;
-    this._latency = 0;
-    this.pingStartTime = 0;
-    this.pingInterval = null;
-    this.state = state;
-    this.myId = config.playerId;
-    this.config = config;
-    let smoothing = options?.smoothing ?? "lerp";
-    if (options?.interpolate === false) {
-      smoothing = "none";
-    } else if (options?.interpolate === true && !options?.smoothing) {
-      smoothing = "lerp";
-    }
-    this.options = {
-      tickRate: options?.tickRate ?? 20,
-      smoothing,
-      lerpFactor: options?.lerpFactor ?? 0.15,
-      interpolate: smoothing !== "none",
-      // Legacy compat
-      interpolationDelay: options?.interpolationDelay ?? 100,
-      jitterBuffer: options?.jitterBuffer ?? 0,
-      autoReconnect: options?.autoReconnect ?? true,
-      maxReconnectAttempts: options?.maxReconnectAttempts ?? 10
-    };
-  }
-  /** Current room ID (null if not in a room) */
-  get roomId() {
-    return this._roomId;
-  }
-  /** Whether currently connected to a room */
-  get connected() {
-    return this.ws?.readyState === WebSocket.OPEN;
-  }
-  /** Number of players in the current room */
-  get playerCount() {
-    return this._playerCount;
-  }
-  /** Current latency to server in milliseconds */
-  get latency() {
-    return this._latency;
-  }
-  /**
-   * Join a room - your state will sync with everyone in this room
-   * 
-   * @param roomId - Room identifier (any string)
-   * @param options - Join options
-   */
-  async join(roomId, options) {
-    if (this._roomId && !this.isReconnecting) {
-      await this.leave();
-    }
-    this._roomId = roomId;
-    this.lastJoinOptions = options;
-    this.reconnectAttempts = 0;
-    await this.connectWebSocket(roomId, options);
-    this.startSyncLoop();
-    this.startInterpolationLoop();
-  }
-  /**
-   * Leave the current room
-   */
-  async leave() {
-    if (this.reconnectTimeout) {
-      clearTimeout(this.reconnectTimeout);
-      this.reconnectTimeout = null;
-    }
-    this.isReconnecting = false;
-    this.stopSyncLoop();
-    this.stopInterpolationLoop();
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
-    this.clearRemotePlayers();
-    this.snapshots.clear();
-    this.jitterQueue = [];
-    this._roomId = null;
-  }
-  /**
-   * Send a one-off message to all players in the room
-   * 
-   * @param data - Any JSON-serializable data
-   */
-  broadcast(data) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: "broadcast", data }));
-    }
-  }
-  /**
-   * Create a new room and join it
-   * 
-   * @param options - Room creation options
-   * @returns The room code/ID
-   */
-  async create(options) {
-    const code = this.generateRoomCode();
-    await this.join(code, { ...options, create: true });
-    return code;
-  }
-  /**
-   * List public rooms
-   */
-  async listRooms() {
-    const response = await fetch(`${this.config.apiUrl}/v1/sync/rooms?gameId=${this.config.gameId}`, {
-      headers: this.getHeaders()
-    });
-    if (!response.ok) {
-      const data2 = await response.json();
-      throw new Error(data2.error || "Failed to list rooms");
-    }
-    const data = await response.json();
-    return data.rooms || [];
-  }
-  /**
-   * Subscribe to sync events
-   */
-  on(event, callback) {
-    if (!this.listeners.has(event)) {
-      this.listeners.set(event, /* @__PURE__ */ new Set());
-    }
-    this.listeners.get(event).add(callback);
-  }
-  /**
-   * Unsubscribe from sync events
-   */
-  off(event, callback) {
-    this.listeners.get(event)?.delete(callback);
-  }
-  emit(event, ...args) {
-    this.listeners.get(event)?.forEach((cb) => {
-      try {
-        cb(...args);
-      } catch (e) {
-        console.error(`Error in sync ${event} handler:`, e);
-      }
-    });
-  }
-  async connectWebSocket(roomId, options) {
-    return new Promise((resolve, reject) => {
-      const wsUrl = this.config.apiUrl.replace("https://", "wss://").replace("http://", "ws://");
-      const params = new URLSearchParams({
-        playerId: this.config.playerId,
         gameId: this.config.gameId,
-        ...this.config.apiKey ? { apiKey: this.config.apiKey } : {},
-        ...options?.create ? { create: "true" } : {},
-        ...options?.maxPlayers ? { maxPlayers: String(options.maxPlayers) } : {},
-        ...options?.public ? { public: "true" } : {},
-        ...options?.metadata ? { metadata: JSON.stringify(options.metadata) } : {}
+        ...this.config.create ? { create: "true" } : {},
+        ...this.config.name ? { name: this.config.name } : {},
+        ...this.config.meta ? { meta: JSON.stringify(this.config.meta) } : {}
       });
-      const url = `${wsUrl}/v1/sync/${roomId}/ws?${params}`;
+      const url = `${wsUrl}/v1/connect/${this.config.roomId}/ws?${params}`;
       this.ws = new WebSocket(url);
       const timeout = setTimeout(() => {
         reject(new Error("Connection timeout"));
@@ -462,6 +64,8 @@ var Sync = class {
       }, 1e4);
       this.ws.onopen = () => {
         clearTimeout(timeout);
+        this._connected = true;
+        this.reconnectAttempts = 0;
         this.emit("connected");
         resolve();
       };
@@ -472,553 +76,237 @@ var Sync = class {
         reject(error);
       };
       this.ws.onclose = () => {
-        this.stopSyncLoop();
+        this._connected = false;
         this.emit("disconnected");
-        if (this.options.autoReconnect && this._roomId && !this.isReconnecting) {
-          this.attemptReconnect();
-        }
+        this.attemptReconnect();
       };
       this.ws.onmessage = (event) => {
         try {
-          const data = JSON.parse(event.data);
-          this.handleMessage(data);
+          const msg = JSON.parse(event.data);
+          this.handleMessage(msg);
         } catch (e) {
-          console.error("Failed to parse sync message:", e);
+          console.error("Failed to parse message:", e);
         }
       };
     });
   }
-  handleMessage(data) {
-    if (data.serverTime) {
-      this.serverTimeOffset = Date.now() - data.serverTime;
-    }
-    switch (data.type) {
+  handleMessage(msg) {
+    switch (msg.type) {
       case "welcome":
-        if (data.state) {
-          this.applyFullState(data.state);
+        this._hostId = msg.hostId || msg.room?.hostId || "";
+        if (msg.players) {
+          for (const p of msg.players) {
+            this._players.set(p.id, p);
+          }
         }
-        this._playerCount = data.playerCount || 1;
-        this.emit("welcome", { playerCount: data.playerCount, tick: data.tick });
-        break;
-      case "full_state":
-        this.applyFullState(data.state);
-        break;
-      case "state":
-        this.applyPlayerState(data.playerId, data.data, data.serverTime);
         break;
       case "join":
-        this._playerCount = data.playerCount || this._playerCount + 1;
-        this.emit("join", data.playerId);
+        const joinedPlayer = {
+          id: msg.playerId,
+          name: msg.name,
+          meta: msg.meta,
+          joinedAt: msg.joinedAt || Date.now()
+        };
+        this._players.set(msg.playerId, joinedPlayer);
+        this.emit("join", joinedPlayer);
         break;
       case "leave":
-        this._playerCount = data.playerCount || Math.max(1, this._playerCount - 1);
-        this.removePlayer(data.playerId);
-        this.emit("leave", data.playerId);
+        const leftPlayer = this._players.get(msg.playerId);
+        this._players.delete(msg.playerId);
+        if (leftPlayer) this.emit("leave", leftPlayer);
+        break;
+      case "host_changed":
+        this._hostId = msg.hostId;
         break;
       case "message":
-        this.emit("message", data.from, data.data);
+      case "broadcast":
+        this.emit("message", msg.from, msg.data, {
+          serverTime: msg.serverTime || Date.now(),
+          tick: msg.tick || 0
+        });
+        break;
+      case "direct":
+        this.emit("message", msg.from, msg.data, {
+          serverTime: msg.serverTime || Date.now(),
+          tick: msg.tick || 0
+        });
         break;
       case "pong":
-        if (this.pingStartTime) {
-          this._latency = Date.now() - this.pingStartTime;
-          this._playerCount = data.playerCount || this._playerCount;
-        }
         break;
     }
-  }
-  applyFullState(fullState) {
-    for (const [playerId, playerState] of Object.entries(fullState)) {
-      if (playerId !== this.myId) {
-        this.applyPlayerState(playerId, playerState);
-      }
-    }
-  }
-  applyPlayerState(playerId, playerState, serverTime) {
-    const timestamp = serverTime ? serverTime + this.serverTimeOffset : Date.now();
-    switch (this.options.smoothing) {
-      case "lerp":
-        this.setLerpTarget(playerId, playerState);
-        break;
-      case "interpolate":
-        if (this.options.jitterBuffer > 0) {
-          this.jitterQueue.push({
-            deliverAt: timestamp + this.options.jitterBuffer,
-            playerId,
-            state: { ...playerState },
-            timestamp
-          });
-        } else {
-          this.addSnapshot(playerId, playerState, timestamp);
-        }
-        break;
-      case "none":
-      default:
-        this.applyStateDirect(playerId, playerState);
-        break;
-    }
-  }
-  setLerpTarget(playerId, playerState) {
-    const isNewPlayer = !this.lerpTargets.has(playerId);
-    this.lerpTargets.set(playerId, { ...playerState });
-    const playersKey = this.findPlayersKey();
-    if (playersKey) {
-      const players = this.state[playersKey];
-      if (isNewPlayer || !players[playerId]) {
-        players[playerId] = { ...playerState };
-      }
-    }
-  }
-  addSnapshot(playerId, playerState, timestamp) {
-    const isNewPlayer = !this.snapshots.has(playerId);
-    if (isNewPlayer) {
-      this.snapshots.set(playerId, []);
-    }
-    const playerSnapshots = this.snapshots.get(playerId);
-    playerSnapshots.push({
-      time: timestamp || Date.now(),
-      state: { ...playerState }
-    });
-    while (playerSnapshots.length > 10) {
-      playerSnapshots.shift();
-    }
-    const playersKey = this.findPlayersKey();
-    if (playersKey) {
-      const players = this.state[playersKey];
-      if (isNewPlayer || !players[playerId]) {
-        players[playerId] = { ...playerState };
-      }
-    }
-  }
-  applyStateDirect(playerId, playerState) {
-    const playersKey = this.findPlayersKey();
-    if (!playersKey) return;
-    const players = this.state[playersKey];
-    players[playerId] = playerState;
-  }
-  removePlayer(playerId) {
-    const playersKey = this.findPlayersKey();
-    if (!playersKey) return;
-    const players = this.state[playersKey];
-    delete players[playerId];
-    this.snapshots.delete(playerId);
-    this.lerpTargets.delete(playerId);
   }
   attemptReconnect() {
-    if (this.reconnectAttempts >= this.options.maxReconnectAttempts) {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.emit("error", new Error("Max reconnection attempts reached"));
       return;
     }
-    this.isReconnecting = true;
     this.reconnectAttempts++;
     const delay = Math.min(1e3 * Math.pow(2, this.reconnectAttempts - 1), 3e4);
-    this.emit("reconnecting", { attempt: this.reconnectAttempts, delay });
     this.reconnectTimeout = setTimeout(async () => {
       try {
-        await this.connectWebSocket(this._roomId, this.lastJoinOptions);
-        this.startSyncLoop();
-        this.isReconnecting = false;
-        this.reconnectAttempts = 0;
-        this.emit("reconnected");
+        await this.connect();
       } catch (e) {
-        this.isReconnecting = false;
       }
     }, delay);
   }
-  clearRemotePlayers() {
-    const playersKey = this.findPlayersKey();
-    if (!playersKey) return;
-    const players = this.state[playersKey];
-    for (const playerId of Object.keys(players)) {
-      if (playerId !== this.myId) {
-        delete players[playerId];
-      }
-    }
-    this.snapshots.clear();
-    this.lerpTargets.clear();
-    this.jitterQueue = [];
+  // === MESSAGING ===
+  /** Send data to all players in the room */
+  broadcast(data) {
+    this.send_ws({ type: "broadcast", data });
   }
-  findPlayersKey() {
-    const candidates = ["players", "entities", "gnomes", "users", "clients"];
-    for (const key of candidates) {
-      if (key in this.state && typeof this.state[key] === "object") {
-        return key;
-      }
-    }
-    for (const key of Object.keys(this.state)) {
-      if (typeof this.state[key] === "object" && this.state[key] !== null) {
-        return key;
-      }
-    }
-    return null;
+  /** Send data to a specific player */
+  send(playerId, data) {
+    this.send_ws({ type: "direct", to: playerId, data });
   }
-  startSyncLoop() {
-    if (this.syncInterval) return;
-    const intervalMs = 1e3 / this.options.tickRate;
-    this.syncInterval = setInterval(() => {
-      this.syncMyState();
-    }, intervalMs);
-  }
-  startInterpolationLoop() {
-    if (this.interpolationInterval) return;
-    if (this.options.smoothing === "none") return;
-    this.interpolationInterval = setInterval(() => {
-      if (this.options.smoothing === "lerp") {
-        this.updateLerp();
-      } else if (this.options.smoothing === "interpolate") {
-        this.processJitterQueue();
-        this.updateInterpolation();
-      }
-    }, 16);
-    this.pingInterval = setInterval(() => {
-      this.measureLatency();
-    }, 2e3);
-  }
-  /**
-   * Frame-based lerping (gnome-chat style)
-   * Lerps each remote player's position toward their target by lerpFactor each frame.
-   * Simple, zero latency, great for casual games.
-   */
-  updateLerp() {
-    const playersKey = this.findPlayersKey();
-    if (!playersKey) return;
-    const players = this.state[playersKey];
-    const lerpFactor = this.options.lerpFactor;
-    for (const [playerId, target] of this.lerpTargets) {
-      if (playerId === this.myId) continue;
-      const player = players[playerId];
-      if (!player) continue;
-      for (const [key, targetValue] of Object.entries(target)) {
-        if (typeof targetValue === "number" && typeof player[key] === "number") {
-          const current = player[key];
-          player[key] = current + (targetValue - current) * lerpFactor;
-        } else if (typeof targetValue !== "number") {
-          player[key] = targetValue;
-        }
-      }
-    }
-  }
-  measureLatency() {
+  send_ws(data) {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.pingStartTime = Date.now();
-      this.ws.send(JSON.stringify({ type: "ping" }));
+      this.ws.send(JSON.stringify(data));
     }
   }
-  stopInterpolationLoop() {
-    if (this.interpolationInterval) {
-      clearInterval(this.interpolationInterval);
-      this.interpolationInterval = null;
+  // === EVENTS ===
+  on(event, callback) {
+    if (!this.listeners.has(event)) {
+      this.listeners.set(event, /* @__PURE__ */ new Set());
     }
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = null;
-    }
+    this.listeners.get(event).add(callback);
   }
-  processJitterQueue() {
-    const now = Date.now();
-    const ready = this.jitterQueue.filter((item) => item.deliverAt <= now);
-    this.jitterQueue = this.jitterQueue.filter((item) => item.deliverAt > now);
-    for (const item of ready) {
-      this.addSnapshot(item.playerId, item.state, item.timestamp);
-    }
+  off(event, callback) {
+    this.listeners.get(event)?.delete(callback);
   }
-  stopSyncLoop() {
-    if (this.syncInterval) {
-      clearInterval(this.syncInterval);
-      this.syncInterval = null;
-    }
-  }
-  syncMyState() {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    const playersKey = this.findPlayersKey();
-    if (!playersKey) return;
-    const players = this.state[playersKey];
-    const myState = players[this.myId];
-    if (!myState) return;
-    const stateJson = JSON.stringify(myState);
-    if (stateJson === this.lastSentState) return;
-    this.lastSentState = stateJson;
-    this.ws.send(JSON.stringify({
-      type: "state",
-      data: myState
-    }));
-  }
-  updateInterpolation() {
-    const playersKey = this.findPlayersKey();
-    if (!playersKey) return;
-    const players = this.state[playersKey];
-    const renderTime = Date.now() - this.options.interpolationDelay;
-    for (const [playerId, playerSnapshots] of this.snapshots) {
-      if (playerId === this.myId) continue;
-      const player = players[playerId];
-      if (!player) continue;
-      let before = null;
-      let after = null;
-      for (const snapshot of playerSnapshots) {
-        if (snapshot.time <= renderTime) {
-          before = snapshot;
-        } else if (!after) {
-          after = snapshot;
-        }
+  emit(event, ...args) {
+    this.listeners.get(event)?.forEach((cb) => {
+      try {
+        cb(...args);
+      } catch (e) {
+        console.error(`Error in ${event} handler:`, e);
       }
-      if (before && after) {
-        const total = after.time - before.time;
-        const elapsed = renderTime - before.time;
-        const alpha = total > 0 ? Math.min(1, elapsed / total) : 1;
-        this.lerpState(player, before.state, after.state, alpha);
-      } else if (before) {
-        this.lerpState(player, player, before.state, 0.3);
-      } else if (after) {
-        this.lerpState(player, player, after.state, 0.3);
+    });
+  }
+  // === PERSISTENCE ===
+  /** Save data to cloud storage (per-player) */
+  async save(key, data) {
+    const response = await fetch(
+      `${this.config.apiUrl}/v1/saves/${encodeURIComponent(key)}`,
+      {
+        method: "POST",
+        headers: this.getHeaders(),
+        body: JSON.stringify(data)
       }
+    );
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.error || "Failed to save");
     }
   }
-  lerpState(target, from, to, alpha) {
-    for (const key of Object.keys(to)) {
-      const fromVal = from[key];
-      const toVal = to[key];
-      if (typeof fromVal === "number" && typeof toVal === "number") {
-        target[key] = fromVal + (toVal - fromVal) * alpha;
-      } else {
-        if (alpha > 0.5) {
-          target[key] = toVal;
-        }
+  /** Load data from cloud storage (per-player) */
+  async load(key) {
+    const response = await fetch(
+      `${this.config.apiUrl}/v1/saves/${encodeURIComponent(key)}`,
+      {
+        method: "GET",
+        headers: this.getHeaders()
       }
+    );
+    if (!response.ok) {
+      if (response.status === 404) return null;
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.error || "Failed to load");
     }
+    const result = await response.json();
+    return result.data;
   }
-  generateRoomCode() {
-    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let code = "";
-    for (let i = 0; i < 6; i++) {
-      code += chars[Math.floor(Math.random() * chars.length)];
+  /** Delete saved data */
+  async delete(key) {
+    const response = await fetch(
+      `${this.config.apiUrl}/v1/saves/${encodeURIComponent(key)}`,
+      {
+        method: "DELETE",
+        headers: this.getHeaders()
+      }
+    );
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.error || "Failed to delete");
     }
-    return code;
   }
   getHeaders() {
-    const headers = {
+    return {
       "Content-Type": "application/json",
       "X-Player-ID": this.config.playerId,
       "X-Game-ID": this.config.gameId
     };
-    if (this.config.apiKey) {
-      headers["Authorization"] = `Bearer ${this.config.apiKey}`;
-    }
-    return headers;
   }
-};
-var Watchtower = class {
-  constructor(config) {
-    Object.defineProperty(this, "config", {
-      value: {
-        gameId: config.gameId,
-        playerId: config.playerId || this.generatePlayerId(),
-        apiUrl: config.apiUrl || "https://watchtower-api.watchtower-host.workers.dev",
-        apiKey: config.apiKey || ""
-      },
-      writable: false,
-      enumerable: false,
-      configurable: false
-    });
+  // === ROOM INFO ===
+  /** Room code for sharing */
+  get code() {
+    return this.config.roomId;
   }
-  generatePlayerId() {
-    try {
-      if (typeof localStorage !== "undefined") {
-        const stored = localStorage.getItem("watchtower_player_id");
-        if (stored) return stored;
-        const id = "player_" + Math.random().toString(36).substring(2, 11);
-        localStorage.setItem("watchtower_player_id", id);
-        return id;
-      }
-    } catch {
-    }
-    return "player_" + Math.random().toString(36).substring(2, 11);
-  }
-  /** Get the current player ID */
+  /** Your player ID */
   get playerId() {
     return this.config.playerId;
   }
-  /** Get the game ID */
-  get gameId() {
-    return this.config.gameId;
+  /** Current host player ID */
+  get hostId() {
+    return this._hostId;
   }
-  // ============ HTTP HELPERS ============
-  async fetch(method, path, body) {
-    const headers = {
-      "Content-Type": "application/json",
-      "X-Player-ID": this.config.playerId,
-      "X-Game-ID": this.config.gameId
-    };
-    if (this.config.apiKey) {
-      headers["Authorization"] = `Bearer ${this.config.apiKey}`;
+  /** Are you the host? */
+  get isHost() {
+    return this._hostId === this.config.playerId;
+  }
+  /** List of players in the room */
+  get players() {
+    return Array.from(this._players.values());
+  }
+  /** Number of players in the room */
+  get playerCount() {
+    return this._players.size;
+  }
+  /** Is WebSocket connected? */
+  get connected() {
+    return this._connected;
+  }
+  // === LIFECYCLE ===
+  /** Leave the room and disconnect */
+  leave() {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
     }
-    const response = await fetch(`${this.config.apiUrl}${path}`, {
-      method,
-      headers,
-      // Use !== undefined to handle falsy values like null, 0, false, ''
-      body: body !== void 0 ? JSON.stringify(body) : void 0
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.error || `HTTP ${response.status}`);
+    this.reconnectAttempts = this.maxReconnectAttempts;
+    this.ws?.close();
+    this.ws = null;
+    this._connected = false;
+    this._players.clear();
+  }
+  // === UTILS ===
+  generatePlayerId() {
+    if (typeof localStorage !== "undefined") {
+      const stored = localStorage.getItem("watchtower_player_id");
+      if (stored) return stored;
+      const id = "p_" + Math.random().toString(36).substring(2, 11);
+      localStorage.setItem("watchtower_player_id", id);
+      return id;
     }
-    return data;
-  }
-  // ============ SAVES API ============
-  /**
-   * Save data to the cloud
-   * @param key - Save slot name (e.g., "progress", "settings")
-   * @param data - Any JSON-serializable data
-   */
-  async save(key, data) {
-    await this.fetch("POST", `/v1/saves/${encodeURIComponent(key)}`, data);
-  }
-  /**
-   * Load data from the cloud
-   * @param key - Save slot name
-   * @returns The saved data, or null if not found
-   */
-  async load(key) {
-    try {
-      const result = await this.fetch("GET", `/v1/saves/${encodeURIComponent(key)}`);
-      return result.data;
-    } catch (e) {
-      if (e.message === "Save not found") {
-        return null;
-      }
-      throw e;
-    }
-  }
-  /**
-   * List all save keys for this player
-   */
-  async listSaves() {
-    const result = await this.fetch("GET", "/v1/saves");
-    return result.keys;
-  }
-  /**
-   * Delete a save
-   * @param key - Save slot name
-   */
-  async deleteSave(key) {
-    await this.fetch("DELETE", `/v1/saves/${encodeURIComponent(key)}`);
-  }
-  // ============ ROOMS API ============
-  /**
-   * Create a new multiplayer room
-   * @returns A Room instance (already connected)
-   */
-  async createRoom() {
-    const result = await this.fetch("POST", "/v1/rooms");
-    const room = new Room(result.code, this.config);
-    await room.connect();
-    return room;
-  }
-  /**
-   * Join an existing room by code
-   * @param code - The 4-letter room code
-   * @returns A Room instance (already connected)
-   */
-  async joinRoom(code) {
-    code = code.toUpperCase().trim();
-    await this.fetch("POST", `/v1/rooms/${code}/join`);
-    const room = new Room(code, this.config);
-    await room.connect();
-    return room;
-  }
-  /**
-   * Get info about a room without joining
-   * @param code - The 4-letter room code
-   */
-  async getRoomInfo(code) {
-    code = code.toUpperCase().trim();
-    return this.fetch("GET", `/v1/rooms/${code}`);
-  }
-  // ============ STATS API ============
-  /**
-   * Get game-wide stats
-   * @returns Stats like online players, DAU, rooms active, etc.
-   * 
-   * @example
-   * ```ts
-   * const stats = await wt.getStats()
-   * console.log(`${stats.online} players online`)
-   * console.log(`${stats.rooms} active rooms`)
-   * ```
-   */
-  async getStats() {
-    return this.fetch("GET", "/v1/stats");
-  }
-  /**
-   * Get the current player's stats
-   * @returns Player's firstSeen, sessions count, playtime
-   * 
-   * @example
-   * ```ts
-   * const me = await wt.getPlayerStats()
-   * console.log(`You've played ${Math.floor(me.playtime / 3600)} hours`)
-   * console.log(`Member since ${new Date(me.firstSeen).toLocaleDateString()}`)
-   * ```
-   */
-  async getPlayerStats() {
-    return this.fetch("GET", "/v1/stats/player");
-  }
-  /**
-   * Track a session start (call on game load)
-   * This is called automatically if you use createRoom/joinRoom
-   */
-  async trackSessionStart() {
-    await this.fetch("POST", "/v1/stats/track", { event: "session_start" });
-  }
-  /**
-   * Track a session end (call on game close)
-   */
-  async trackSessionEnd() {
-    await this.fetch("POST", "/v1/stats/track", { event: "session_end" });
-  }
-  /**
-   * Convenience getter for stats (same as getStats but as property style)
-   * Note: This returns a promise, use `await wt.stats` or `wt.getStats()`
-   */
-  get stats() {
-    return this.getStats();
-  }
-  // ============ SYNC API ============
-  /**
-   * Create a synchronized state object
-   * 
-   * Point this at your game state and it becomes multiplayer.
-   * No events, no callbacks - just read and write your state.
-   * 
-   * @param state - Your game state object (e.g., { players: {} })
-   * @param options - Sync options (tickRate, interpolation)
-   * @returns A Sync instance
-   * 
-   * @example
-   * ```ts
-   * const state = { players: {} }
-   * const sync = wt.sync(state)
-   * 
-   * await sync.join('my-room')
-   * 
-   * // Add yourself
-   * state.players[sync.myId] = { x: 0, y: 0 }
-   * 
-   * // Move (automatically syncs to others)
-   * state.players[sync.myId].x = 100
-   * 
-   * // Others appear automatically in state.players!
-   * for (const [id, player] of Object.entries(state.players)) {
-   *   draw(player.x, player.y)
-   * }
-   * ```
-   */
-  sync(state, options) {
-    return new Sync(state, this.config, options);
+    return "p_" + Math.random().toString(36).substring(2, 11);
   }
 };
-var index_default = Watchtower;
+async function connect(roomId, options) {
+  const code = roomId || generateRoomCode();
+  const room = new Room(code, options);
+  await room.connect();
+  return room;
+}
+function generateRoomCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "";
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+var index_default = { connect, Room };
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   Room,
-  Sync,
-  Watchtower
+  connect
 });

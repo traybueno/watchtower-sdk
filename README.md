@@ -1,6 +1,6 @@
 # @watchtower-sdk/core
 
-The simplest way to add multiplayer to your game. Point at your state, join a room, done.
+Multiplayer infrastructure in one line. Your architecture.
 
 ## Installation
 
@@ -11,397 +11,303 @@ npm install @watchtower-sdk/core
 ## Quick Start
 
 ```typescript
-import { Watchtower } from '@watchtower-sdk/core'
+import { connect } from '@watchtower-sdk/core'
 
-const wt = new Watchtower({
-  gameId: 'my-game',
-  apiKey: 'wt_live_...'  // Get from watchtower.host
+// Connect to a room (creates it if it doesn't exist)
+const room = await connect('my-room')
+
+// Send to everyone
+room.broadcast({ x: 100, y: 200, action: 'move' })
+
+// Receive messages
+room.on('message', (from, data, meta) => {
+  console.log(`Player ${from}:`, data)
+  console.log('Server time:', meta.serverTime)
 })
 
-// Your game state
-const state = { players: {} }
-
-// Make it multiplayer
-const sync = wt.sync(state)
-await sync.join('my-room')
-
-// Add yourself
-state.players[sync.myId] = { x: 0, y: 0, name: 'Player1' }
-
-// Move (automatically syncs!)
-state.players[sync.myId].x += 10
-
-// Others appear automatically in state.players
-for (const [id, player] of Object.entries(state.players)) {
-  drawPlayer(player.x, player.y)
-}
+// Room info
+console.log('Players:', room.players)
+console.log('Am I host?', room.isHost)
+console.log('Share code:', room.code)
 ```
 
-No events. No message handlers. Just read and write your state.
+## What You Get
+
+| Feature | Description |
+|---------|-------------|
+| **Connection** | WebSocket to room, auto-reconnect |
+| **Rooms** | Create/join with codes, share URLs |
+| **Messaging** | Broadcast to all, or send to one |
+| **Player tracking** | Who's in, who's host |
+| **Timestamps** | Server time + tick on every message |
+| **Persistence** | Save/load per-player data |
+
+## What You Build
+
+| Feature | Description |
+|---------|-------------|
+| **State sync** | You decide how to sync state |
+| **Interpolation** | You smooth movement if needed |
+| **Game logic** | You control everything |
 
 ---
 
-## State Templates
+## API Reference
 
-Pick the pattern that matches your game:
+### `connect(roomId?, options?)`
 
-### Movement Game (Cursor Party, Agar.io)
+Connect to a room. Creates it if it doesn't exist.
 
 ```typescript
-interface GameState {
-  players: Record<string, {
-    x: number
-    y: number
-    name: string
-    color: string
-  }>
-}
+// Join or create room
+const room = await connect('ABCD')
 
-const state: GameState = { players: {} }
-const sync = wt.sync(state, { 
-  interpolate: true,
-  interpolationDelay: 100,
-  jitterBuffer: 50
+// Auto-generate room code
+const room = await connect()
+console.log('Share:', room.code)  // e.g., "X7K2M9"
+
+// With options
+const room = await connect('ABCD', {
+  name: 'Player1',
+  meta: { avatar: 'knight', color: '#ff0000' }
 })
 ```
 
-### Chat / Lobby
-
-```typescript
-interface GameState {
-  players: Record<string, {
-    name: string
-    avatar: string
-    ready: boolean
-  }>
-  messages: Array<{
-    from: string
-    text: string
-    ts: number
-  }>
-}
-
-const state: GameState = { players: {}, messages: [] }
-const sync = wt.sync(state, { interpolate: false })  // No movement = no interpolation needed
-```
-
-### Turn-Based (Chess, Cards)
-
-```typescript
-interface GameState {
-  players: Record<string, {
-    name: string
-    hand?: Card[]  // Hidden from others in real implementation
-  }>
-  currentTurn: string
-  board: BoardState
-  phase: 'waiting' | 'playing' | 'finished'
-}
-
-const state: GameState = { 
-  players: {}, 
-  currentTurn: '', 
-  board: initialBoard,
-  phase: 'waiting'
-}
-const sync = wt.sync(state, { interpolate: false })
-```
-
-### Action Game (Shooter, Brawler)
-
-```typescript
-interface GameState {
-  players: Record<string, {
-    x: number
-    y: number
-    vx: number  // Velocity helps with prediction
-    vy: number
-    health: number
-    facing: 'left' | 'right'
-    animation: string
-  }>
-}
-
-const state: GameState = { players: {} }
-const sync = wt.sync(state, {
-  interpolate: true,
-  interpolationDelay: 50,  // Lower for faster games
-  jitterBuffer: 25
-})
-```
+**Options:**
+| Option | Type | Description |
+|--------|------|-------------|
+| `gameId` | string | Your game ID (defaults to hostname) |
+| `playerId` | string | Your player ID (auto-generated) |
+| `name` | string | Display name |
+| `meta` | object | Custom metadata (avatar, color, etc) |
 
 ---
 
-## Smoothing Options
+### Messaging
 
-The SDK automatically smooths remote player movement using frame-based lerping (like gnome-chat).
+#### `room.broadcast(data)`
+
+Send data to all players in the room.
 
 ```typescript
-const sync = wt.sync(state, {
-  // Smoothing mode (default: 'lerp')
-  smoothing: 'lerp',         // 'lerp' | 'interpolate' | 'none'
+room.broadcast({ type: 'move', x: 100, y: 200 })
+room.broadcast({ type: 'chat', text: 'Hello!' })
+room.broadcast({ type: 'shoot', angle: 45 })
+```
+
+#### `room.send(playerId, data)`
+
+Send data to a specific player.
+
+```typescript
+room.send('player123', { type: 'private', text: 'Hey!' })
+```
+
+#### `room.on('message', callback)`
+
+Receive messages from other players.
+
+```typescript
+room.on('message', (from, data, meta) => {
+  // from: player ID who sent it
+  // data: whatever they sent
+  // meta: { serverTime, tick }
   
-  // Lerp settings (for smoothing: 'lerp')
-  lerpFactor: 0.15,          // 0.1 = smooth, 0.3 = snappy (default: 0.15)
-  
-  // Interpolation settings (for smoothing: 'interpolate')
-  interpolationDelay: 100,   // Render others Xms in the past
-  jitterBuffer: 50,          // Buffer packets Xms to smooth delivery
-  
-  // Core settings
-  tickRate: 20,              // Updates per second (default: 20)
-  autoReconnect: true,       // Auto-reconnect on disconnect (default: true)
-  maxReconnectAttempts: 10   // Give up after X attempts (default: 10)
-})
-```
-
-### Smoothing Modes
-
-| Mode | Latency | Best For |
-|------|---------|----------|
-| `lerp` (default) | 0ms | Casual games, cursor parties, .io games |
-| `interpolate` | 50-100ms | Competitive, shooters (more accurate) |
-| `none` | 0ms | Turn-based, chat (no movement) |
-
-### Lerp Factor Guide
-
-| Value | Feel | Use Case |
-|-------|------|----------|
-| 0.1 | Very smooth, floaty | Cursors, casual |
-| 0.15 | Balanced (default) | Most games |
-| 0.25 | Snappy | Action games |
-| 0.3+ | Very responsive | Fast-paced |
-
-**How lerp works:** Every frame (60fps), remote players move 15% toward their target position. This creates natural smooth catch-up with zero added latency.
-
----
-
-## Properties
-
-```typescript
-sync.myId        // Your player ID
-sync.roomId      // Current room ID, or null
-sync.connected   // WebSocket connected?
-sync.playerCount // Players in room
-sync.latency     // RTT to server in ms
-```
-
----
-
-## Rooms
-
-```typescript
-// Create a new room
-const code = await sync.create({ maxPlayers: 4 })
-console.log('Share this code:', code)  // e.g., "A3B7X2"
-
-// Join existing room
-await sync.join('A3B7X2')
-
-// Leave room
-await sync.leave()
-
-// List public rooms
-const rooms = await sync.listRooms()
-```
-
----
-
-## Events
-
-You don't *need* events — just read your state. But if you want notifications:
-
-```typescript
-// Player events
-sync.on('join', (playerId) => console.log(`${playerId} joined`))
-sync.on('leave', (playerId) => console.log(`${playerId} left`))
-
-// Connection events
-sync.on('connected', () => console.log('Connected!'))
-sync.on('disconnected', () => console.log('Disconnected'))
-sync.on('reconnecting', ({ attempt, delay }) => console.log(`Reconnecting in ${delay}ms...`))
-sync.on('reconnected', () => console.log('Reconnected!'))
-
-// Error handling
-sync.on('error', (err) => console.error(err))
-```
-
----
-
-## Broadcast Messages
-
-For one-off events that don't belong in state (explosions, sound effects):
-
-```typescript
-// Send
-sync.broadcast({ type: 'explosion', x: 100, y: 200 })
-
-// Receive
-sync.on('message', (from, data) => {
-  if (data.type === 'explosion') {
-    playExplosion(data.x, data.y)
+  if (data.type === 'move') {
+    updatePlayer(from, data.x, data.y)
   }
 })
 ```
 
 ---
 
-## Cloud Saves
+### Room Info
 
-Simple key-value storage per player:
+```typescript
+room.code        // Room code for sharing (e.g., "ABCD")
+room.playerId    // Your player ID
+room.players     // Array of { id, name, meta, joinedAt }
+room.playerCount // Number of players
+room.isHost      // Are you the host?
+room.hostId      // Current host's player ID
+room.connected   // WebSocket connected?
+```
+
+---
+
+### Events
+
+```typescript
+room.on('join', (player) => {
+  console.log(`${player.name || player.id} joined!`)
+})
+
+room.on('leave', (player) => {
+  console.log(`${player.id} left`)
+})
+
+room.on('connected', () => {
+  console.log('Connected to room')
+})
+
+room.on('disconnected', () => {
+  console.log('Disconnected (will auto-reconnect)')
+})
+
+room.on('error', (error) => {
+  console.error('Error:', error)
+})
+```
+
+---
+
+### Persistence
+
+Save and load data per-player. Survives sessions.
 
 ```typescript
 // Save
-await wt.save('progress', { level: 5, coins: 100 })
+await room.save('progress', { level: 5, coins: 100 })
 
 // Load
-const progress = await wt.load('progress')
-
-// List all saves
-const keys = await wt.listSaves()  // ['progress']
+const progress = await room.load('progress')
 
 // Delete
-await wt.deleteSave('progress')
+await room.delete('progress')
 ```
 
 ---
 
-## Full Example
+### Lifecycle
 
 ```typescript
-import { Watchtower } from '@watchtower-sdk/core'
+// Leave the room
+room.leave()
+```
 
-const wt = new Watchtower({ gameId: 'my-game', apiKey: 'wt_...' })
+---
 
-// State template: movement game
-const state = { 
-  players: {} as Record<string, { x: number; y: number; color: string }>
+## Patterns
+
+### Cursor Party
+
+```typescript
+const room = await connect('cursors')
+
+document.onmousemove = (e) => {
+  room.broadcast({ x: e.clientX, y: e.clientY })
 }
 
-const sync = wt.sync(state, {
-  interpolate: true,
-  interpolationDelay: 100,
-  jitterBuffer: 50
+const cursors = {}
+
+room.on('message', (from, data) => {
+  cursors[from] = data
 })
 
-// Join or create room
-const code = prompt('Room code? (blank to create)')
-if (code) {
-  await sync.join(code)
-} else {
-  const newCode = await sync.create()
-  alert('Share: ' + newCode)
+room.on('leave', (player) => {
+  delete cursors[player.id]
+})
+
+function draw() {
+  ctx.clearRect(0, 0, width, height)
+  for (const [id, pos] of Object.entries(cursors)) {
+    ctx.fillRect(pos.x - 5, pos.y - 5, 10, 10)
+  }
+  requestAnimationFrame(draw)
+}
+draw()
+```
+
+### Turn-Based Game
+
+```typescript
+const room = await connect('chess')
+
+let gameState = { board: initialBoard, turn: null }
+
+// Host controls game state
+if (room.isHost) {
+  gameState.turn = room.playerId
+  room.broadcast({ type: 'state', ...gameState })
 }
 
-// Add yourself
-state.players[sync.myId] = {
-  x: Math.random() * 800,
-  y: Math.random() * 600,
-  color: '#' + Math.floor(Math.random()*16777215).toString(16)
-}
-
-// Game loop
-function loop() {
-  // Move
-  if (keys.left)  state.players[sync.myId].x -= 5
-  if (keys.right) state.players[sync.myId].x += 5
-  if (keys.up)    state.players[sync.myId].y -= 5
-  if (keys.down)  state.players[sync.myId].y += 5
-  
-  // Draw everyone (others are auto-interpolated!)
-  ctx.clearRect(0, 0, 800, 600)
-  for (const [id, p] of Object.entries(state.players)) {
-    ctx.fillStyle = p.color
-    ctx.fillRect(p.x - 10, p.y - 10, 20, 20)
-    
-    // Show latency for your player
-    if (id === sync.myId) {
-      ctx.fillText(`${sync.latency}ms`, p.x, p.y - 15)
-    }
+room.on('message', (from, data) => {
+  if (data.type === 'state') {
+    gameState = data
+    render()
   }
   
-  // Debug info
-  ctx.fillStyle = '#fff'
-  ctx.fillText(`Players: ${sync.playerCount}`, 10, 20)
-  
-  requestAnimationFrame(loop)
-}
-loop()
-```
+  if (data.type === 'move' && room.isHost) {
+    // Validate and apply move
+    gameState.board = applyMove(gameState.board, data.from, data.to)
+    gameState.turn = getNextPlayer()
+    room.broadcast({ type: 'state', ...gameState })
+  }
+})
 
----
-
-## Private State
-
-Need to hide state from other players? Cards in hand, fog of war, secret roles?
-
-Any field starting with `_` is **private** — only you see it.
-
-```typescript
-state.players[sync.myId] = {
-  // Public - everyone sees
-  x: 100,
-  y: 200,
-  cardCount: 5,
-  
-  // Private - only you see
-  _hand: ['Ace', 'King', 'Queen', '7', '2'],
-  _role: 'impostor'
+function makeMove(from, to) {
+  room.broadcast({ type: 'move', from, to })
 }
 ```
 
-Other players receive:
-```typescript
-{
-  x: 100,
-  y: 200,
-  cardCount: 5
-  // _hand and _role are stripped!
-}
-```
+### Shooter with Events
 
-### Use Cases
-
-**Card Games:**
 ```typescript
-state.players[sync.myId] = {
-  name: 'Player1',
-  cardCount: state.players[sync.myId]._hand.length,
-  _hand: ['Ace', 'King']  // Private!
-}
-```
+const room = await connect('shooter')
 
-**Hidden Roles (Among Us):**
-```typescript
-state.players[sync.myId] = {
-  x, y, alive: true,
-  _role: 'impostor',  // Only I know
-  _canKill: true
-}
-```
+const players = {}
 
-**Fog of War:**
-```typescript
-state.players[sync.myId] = {
-  x, y,
-  _visibleEnemies: ['enemy1', 'enemy3'],  // Only I know what I can see
-  _lastKnownPositions: { ... }
+room.on('message', (from, data, meta) => {
+  switch (data.type) {
+    case 'pos':
+      players[from] = { ...players[from], ...data, lastUpdate: meta.serverTime }
+      break
+    case 'shoot':
+      spawnBullet(from, data.angle)
+      break
+    case 'hit':
+      if (data.target === room.playerId) {
+        myHealth -= data.damage
+      }
+      break
+  }
+})
+
+// Send position updates
+setInterval(() => {
+  room.broadcast({ type: 'pos', x: player.x, y: player.y })
+}, 50)
+
+function shoot(angle) {
+  room.broadcast({ type: 'shoot', angle })
 }
 ```
 
 ---
 
-## Best Practices
+## Smoothing Movement
 
-1. **Keep state flat.** Nested objects sync fine, but flat is faster to diff.
+The SDK doesn't smooth movement — you control that. Here's a simple approach:
 
-2. **Use the `players` key.** The SDK auto-detects `players`, `entities`, `users`, or `clients`.
+```typescript
+const players = {}
+const LERP = 0.15
 
-3. **Use `_` prefix for secrets.** Any field starting with `_` is hidden from other players.
+room.on('message', (from, data) => {
+  if (!players[from]) players[from] = { x: data.x, y: data.y }
+  players[from].targetX = data.x
+  players[from].targetY = data.y
+})
 
-4. **Let the SDK smooth.** Don't add your own lerping — it'll fight the SDK.
-
-5. **Test with "Open another tab".** Easiest way to see multiplayer working.
+function update() {
+  for (const p of Object.values(players)) {
+    p.x += (p.targetX - p.x) * LERP
+    p.y += (p.targetY - p.y) * LERP
+  }
+  requestAnimationFrame(update)
+}
+update()
+```
 
 ---
 
