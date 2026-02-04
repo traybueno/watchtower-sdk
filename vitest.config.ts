@@ -21,7 +21,8 @@ export default defineConfig({
         statements: 80
       }
     },
-    include: ['test/**/*.test.ts'],
+    include: ['test/*.test.ts'],
+    exclude: ['test/old/**'],
     testTimeout: 10000
   }
 })

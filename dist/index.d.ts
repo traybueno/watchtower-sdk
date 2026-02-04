@@ -84,13 +84,15 @@ declare class Room {
     on<K extends keyof EventMap>(event: K, callback: EventMap[K]): void;
     off<K extends keyof EventMap>(event: K, callback: EventMap[K]): void;
     private emit;
+    private getSaveUrl;
     /** Save data to cloud storage (per-player) */
     save(key: string, data: unknown): Promise<void>;
     /** Load data from cloud storage (per-player) */
     load<T = unknown>(key: string): Promise<T | null>;
     /** Delete saved data */
-    delete(key: string): Promise<void>;
-    private getHeaders;
+    deleteSave(key: string): Promise<void>;
+    /** List all saved keys */
+    listSaves(): Promise<string[]>;
     /** Room code for sharing */
     get code(): string;
     /** Your player ID */

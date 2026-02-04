@@ -123,6 +123,8 @@ export class Room {
 
       const url = `${wsUrl}/v1/connect/${this.config.roomId}/ws?${params}`
       this.ws = new WebSocket(url)
+      
+      let welcomed = false
 
       const timeout = setTimeout(() => {
         reject(new Error('Connection timeout'))
@@ -130,11 +132,9 @@ export class Room {
       }, 10000)
 
       this.ws.onopen = () => {
-        clearTimeout(timeout)
         this._connected = true
         this.reconnectAttempts = 0
-        this.emit('connected')
-        resolve()
+        // Don't resolve yet - wait for welcome message
       }
 
       this.ws.onerror = () => {
@@ -147,13 +147,25 @@ export class Room {
       this.ws.onclose = () => {
         this._connected = false
         this.emit('disconnected')
-        this.attemptReconnect()
+        if (welcomed) {
+          this.attemptReconnect()
+        }
       }
 
       this.ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data)
-          this.handleMessage(msg)
+          
+          // Resolve connect() when we receive welcome
+          if (msg.type === 'welcome' && !welcomed) {
+            welcomed = true
+            clearTimeout(timeout)
+            this.handleMessage(msg)
+            this.emit('connected')
+            resolve()
+          } else {
+            this.handleMessage(msg)
+          }
         } catch (e) {
           console.error('Failed to parse message:', e)
         }
@@ -275,16 +287,19 @@ export class Room {
 
   // === PERSISTENCE ===
 
+  private getSaveUrl(key?: string): string {
+    const base = `${this.config.apiUrl}/v1/connect/saves`
+    const params = `?gameId=${encodeURIComponent(this.config.gameId)}&playerId=${encodeURIComponent(this.config.playerId)}`
+    return key ? `${base}/${encodeURIComponent(key)}${params}` : `${base}${params}`
+  }
+
   /** Save data to cloud storage (per-player) */
   async save(key: string, data: unknown): Promise<void> {
-    const response = await fetch(
-      `${this.config.apiUrl}/v1/saves/${encodeURIComponent(key)}`,
-      {
-        method: 'POST',
-        headers: this.getHeaders(),
-        body: JSON.stringify(data)
-      }
-    )
+    const response = await fetch(this.getSaveUrl(key), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    })
     if (!response.ok) {
       const err = await response.json().catch(() => ({}))
       throw new Error(err.error || 'Failed to save')
@@ -293,43 +308,39 @@ export class Room {
 
   /** Load data from cloud storage (per-player) */
   async load<T = unknown>(key: string): Promise<T | null> {
-    const response = await fetch(
-      `${this.config.apiUrl}/v1/saves/${encodeURIComponent(key)}`,
-      {
-        method: 'GET',
-        headers: this.getHeaders()
-      }
-    )
+    const response = await fetch(this.getSaveUrl(key), {
+      method: 'GET'
+    })
     if (!response.ok) {
       if (response.status === 404) return null
       const err = await response.json().catch(() => ({}))
       throw new Error(err.error || 'Failed to load')
     }
-    const result = await response.json()
-    return result.data as T
+    return await response.json() as T
   }
 
   /** Delete saved data */
-  async delete(key: string): Promise<void> {
-    const response = await fetch(
-      `${this.config.apiUrl}/v1/saves/${encodeURIComponent(key)}`,
-      {
-        method: 'DELETE',
-        headers: this.getHeaders()
-      }
-    )
+  async deleteSave(key: string): Promise<void> {
+    const response = await fetch(this.getSaveUrl(key), {
+      method: 'DELETE'
+    })
     if (!response.ok) {
       const err = await response.json().catch(() => ({}))
       throw new Error(err.error || 'Failed to delete')
     }
   }
 
-  private getHeaders(): Record<string, string> {
-    return {
-      'Content-Type': 'application/json',
-      'X-Player-ID': this.config.playerId,
-      'X-Game-ID': this.config.gameId
+  /** List all saved keys */
+  async listSaves(): Promise<string[]> {
+    const response = await fetch(this.getSaveUrl(), {
+      method: 'GET'
+    })
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}))
+      throw new Error(err.error || 'Failed to list saves')
     }
+    const result = await response.json() as { keys: string[] }
+    return result.keys
   }
 
   // === ROOM INFO ===
