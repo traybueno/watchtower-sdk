@@ -22,9 +22,10 @@
  * console.log('Am I host?', room.isHost)
  * console.log('Share code:', room.code)
  * 
- * // Persistence
- * await room.save('progress', { level: 5 })
- * const data = await room.load('progress')
+ * // Kick a player (host only)
+ * if (room.isHost) {
+ *   room.kick('player123', 'Breaking rules')
+ * }
  * ```
  */
 
@@ -43,6 +44,8 @@ export interface ConnectOptions {
   name?: string
   /** Player metadata (avatar, color, etc) */
   meta?: Record<string, unknown>
+  /** Enable debug logging (default: false) */
+  debug?: boolean
 }
 
 interface InternalConfig {
@@ -53,6 +56,7 @@ interface InternalConfig {
   create: boolean
   name?: string
   meta?: Record<string, unknown>
+  debug: boolean
 }
 
 export interface Player {
@@ -67,9 +71,18 @@ export interface MessageMeta {
   tick: number
 }
 
+/** Event stored in history */
+export interface HistoryEvent {
+  type: string
+  serverTime: number
+  tick: number
+  [key: string]: unknown
+}
+
 export type MessageHandler = (from: string, data: unknown, meta: MessageMeta) => void
 export type PlayerHandler = (player: Player) => void
 export type VoidHandler = () => void
+export type KickedHandler = (reason?: string) => void
 
 type EventMap = {
   message: MessageHandler
@@ -77,6 +90,7 @@ type EventMap = {
   leave: PlayerHandler
   connected: VoidHandler
   disconnected: VoidHandler
+  kicked: KickedHandler
   error: (error: Error) => void
 }
 
@@ -89,6 +103,8 @@ export class Room {
   private _players: Map<string, Player> = new Map()
   private _hostId: string = ''
   private _connected: boolean = false
+  private _history: HistoryEvent[] = []
+  private _wasKicked: boolean = false
   private reconnectAttempts: number = 0
   private maxReconnectAttempts: number = 10
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null
@@ -101,7 +117,16 @@ export class Room {
       apiUrl: config.apiUrl || 'https://watchtower-api.watchtower-host.workers.dev',
       create: config.create ?? true,
       name: config.name,
-      meta: config.meta
+      meta: config.meta,
+      debug: config.debug ?? false
+    }
+  }
+
+  // === DEBUG LOGGING ===
+
+  private log(...args: unknown[]) {
+    if (this.config.debug) {
+      console.log('[Watchtower]', ...args)
     }
   }
 
@@ -122,6 +147,9 @@ export class Room {
       })
 
       const url = `${wsUrl}/v1/connect/${this.config.roomId}/ws?${params}`
+      
+      this.log('Connecting to', this.config.roomId)
+      
       this.ws = new WebSocket(url)
       
       let welcomed = false
@@ -147,7 +175,7 @@ export class Room {
       this.ws.onclose = () => {
         this._connected = false
         this.emit('disconnected')
-        if (welcomed) {
+        if (welcomed && !this._wasKicked) {
           this.attemptReconnect()
         }
       }
@@ -156,12 +184,17 @@ export class Room {
         try {
           const msg = JSON.parse(event.data)
           
+          if (msg.type !== 'pong') {
+            this.log('←', msg.type, msg)
+          }
+          
           // Resolve connect() when we receive welcome
           if (msg.type === 'welcome' && !welcomed) {
             welcomed = true
             clearTimeout(timeout)
             this.handleMessage(msg)
             this.emit('connected')
+            this.log('Connected!', 'playerId:', this.config.playerId, 'isHost:', this.isHost)
             resolve()
           } else {
             this.handleMessage(msg)
@@ -182,6 +215,10 @@ export class Room {
             this._players.set(p.id, p)
           }
         }
+        // Load recent history from server
+        if (msg.recentEvents && Array.isArray(msg.recentEvents)) {
+          this._history = msg.recentEvents
+        }
         break
 
       case 'join':
@@ -192,17 +229,20 @@ export class Room {
           joinedAt: msg.joinedAt || Date.now()
         }
         this._players.set(msg.playerId, joinedPlayer)
+        this.log('Player joined:', msg.playerId, msg.name || '')
         this.emit('join', joinedPlayer)
         break
 
       case 'leave':
         const leftPlayer = this._players.get(msg.playerId)
         this._players.delete(msg.playerId)
+        this.log('Player left:', msg.playerId)
         if (leftPlayer) this.emit('leave', leftPlayer)
         break
 
       case 'host_changed':
         this._hostId = msg.hostId
+        this.log('Host changed to:', msg.hostId)
         break
 
       case 'message':
@@ -220,6 +260,23 @@ export class Room {
         })
         break
 
+      case 'kicked':
+        // Someone was kicked (could be us or someone else)
+        if (msg.playerId === this.config.playerId) {
+          this._wasKicked = true
+          this.log('You were kicked:', msg.reason || 'No reason given')
+          this.emit('kicked', msg.reason)
+          // Close connection without reconnecting
+          this.ws?.close()
+        } else {
+          // Another player was kicked - remove them from our list
+          const kickedPlayer = this._players.get(msg.playerId)
+          this._players.delete(msg.playerId)
+          this.log('Player kicked:', msg.playerId, msg.reason || '')
+          if (kickedPlayer) this.emit('leave', kickedPlayer)
+        }
+        break
+
       case 'pong':
         // Could track latency here if needed
         break
@@ -235,6 +292,8 @@ export class Room {
     this.reconnectAttempts++
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts - 1), 30000)
 
+    this.log('Reconnecting in', delay, 'ms (attempt', this.reconnectAttempts, ')')
+
     this.reconnectTimeout = setTimeout(async () => {
       try {
         await this.connect()
@@ -248,11 +307,13 @@ export class Room {
 
   /** Send data to all players in the room */
   broadcast(data: unknown): void {
+    this.log('→ broadcast', data)
     this.send_ws({ type: 'broadcast', data })
   }
 
   /** Send data to a specific player */
   send(playerId: string, data: unknown): void {
+    this.log('→ direct to', playerId, data)
     this.send_ws({ type: 'direct', to: playerId, data })
   }
 
@@ -260,6 +321,25 @@ export class Room {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data))
     }
+  }
+
+  // === HOST ACTIONS ===
+
+  /**
+   * Kick a player from the room (host only)
+   * @param playerId - Player ID to kick
+   * @param reason - Optional reason for the kick
+   */
+  kick(playerId: string, reason?: string): void {
+    if (!this.isHost) {
+      this.log('Cannot kick - not the host')
+      throw new Error('Only the host can kick players')
+    }
+    if (playerId === this.config.playerId) {
+      throw new Error('Cannot kick yourself')
+    }
+    this.log('→ kick', playerId, reason || '')
+    this.send_ws({ type: 'kick', playerId, reason })
   }
 
   // === EVENTS ===
@@ -283,64 +363,6 @@ export class Room {
         console.error(`Error in ${event} handler:`, e)
       }
     })
-  }
-
-  // === PERSISTENCE ===
-
-  private getSaveUrl(key?: string): string {
-    const base = `${this.config.apiUrl}/v1/connect/saves`
-    const params = `?gameId=${encodeURIComponent(this.config.gameId)}&playerId=${encodeURIComponent(this.config.playerId)}`
-    return key ? `${base}/${encodeURIComponent(key)}${params}` : `${base}${params}`
-  }
-
-  /** Save data to cloud storage (per-player) */
-  async save(key: string, data: unknown): Promise<void> {
-    const response = await fetch(this.getSaveUrl(key), {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    })
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}))
-      throw new Error(err.error || 'Failed to save')
-    }
-  }
-
-  /** Load data from cloud storage (per-player) */
-  async load<T = unknown>(key: string): Promise<T | null> {
-    const response = await fetch(this.getSaveUrl(key), {
-      method: 'GET'
-    })
-    if (!response.ok) {
-      if (response.status === 404) return null
-      const err = await response.json().catch(() => ({}))
-      throw new Error(err.error || 'Failed to load')
-    }
-    return await response.json() as T
-  }
-
-  /** Delete saved data */
-  async deleteSave(key: string): Promise<void> {
-    const response = await fetch(this.getSaveUrl(key), {
-      method: 'DELETE'
-    })
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}))
-      throw new Error(err.error || 'Failed to delete')
-    }
-  }
-
-  /** List all saved keys */
-  async listSaves(): Promise<string[]> {
-    const response = await fetch(this.getSaveUrl(), {
-      method: 'GET'
-    })
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}))
-      throw new Error(err.error || 'Failed to list saves')
-    }
-    const result = await response.json() as { keys: string[] }
-    return result.keys
   }
 
   // === ROOM INFO ===
@@ -378,6 +400,11 @@ export class Room {
   /** Is WebSocket connected? */
   get connected(): boolean {
     return this._connected
+  }
+
+  /** Recent events from the room (messages, joins, leaves) */
+  get history(): HistoryEvent[] {
+    return [...this._history]
   }
 
   // === LIFECYCLE ===
@@ -432,6 +459,9 @@ export class Room {
  *   name: 'Player1',
  *   meta: { avatar: 'knight', color: '#ff0000' }
  * })
+ * 
+ * // With debug logging
+ * const room = await connect('my-room', { debug: true })
  * ```
  */
 export async function connect(roomId?: string, options?: ConnectOptions): Promise<Room> {
