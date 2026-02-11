@@ -32,6 +32,8 @@ var Room = class {
     this._players = /* @__PURE__ */ new Map();
     this._hostId = "";
     this._connected = false;
+    this._history = [];
+    this._wasKicked = false;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 10;
     this.reconnectTimeout = null;
@@ -42,8 +44,15 @@ var Room = class {
       apiUrl: config.apiUrl || "https://watchtower-api.watchtower-host.workers.dev",
       create: config.create ?? true,
       name: config.name,
-      meta: config.meta
+      meta: config.meta,
+      debug: config.debug ?? false
     };
+  }
+  // === DEBUG LOGGING ===
+  log(...args) {
+    if (this.config.debug) {
+      console.log("[Watchtower]", ...args);
+    }
   }
   // === CONNECTION ===
   async connect() {
@@ -52,11 +61,12 @@ var Room = class {
       const params = new URLSearchParams({
         playerId: this.config.playerId,
         gameId: this.config.gameId,
-        ...this.config.create ? { create: "true" } : {},
+        create: this.config.create ? "true" : "false",
         ...this.config.name ? { name: this.config.name } : {},
         ...this.config.meta ? { meta: JSON.stringify(this.config.meta) } : {}
       });
       const url = `${wsUrl}/v1/connect/${this.config.roomId}/ws?${params}`;
+      this.log("Connecting to", this.config.roomId);
       this.ws = new WebSocket(url);
       let welcomed = false;
       const timeout = setTimeout(() => {
@@ -76,18 +86,22 @@ var Room = class {
       this.ws.onclose = () => {
         this._connected = false;
         this.emit("disconnected");
-        if (welcomed) {
+        if (welcomed && !this._wasKicked) {
           this.attemptReconnect();
         }
       };
       this.ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
+          if (msg.type !== "pong") {
+            this.log("\u2190", msg.type, msg);
+          }
           if (msg.type === "welcome" && !welcomed) {
             welcomed = true;
             clearTimeout(timeout);
             this.handleMessage(msg);
             this.emit("connected");
+            this.log("Connected!", "playerId:", this.config.playerId, "isHost:", this.isHost);
             resolve();
           } else {
             this.handleMessage(msg);
@@ -107,6 +121,9 @@ var Room = class {
             this._players.set(p.id, p);
           }
         }
+        if (msg.recentEvents && Array.isArray(msg.recentEvents)) {
+          this._history = msg.recentEvents;
+        }
         break;
       case "join":
         const joinedPlayer = {
@@ -116,15 +133,18 @@ var Room = class {
           joinedAt: msg.joinedAt || Date.now()
         };
         this._players.set(msg.playerId, joinedPlayer);
+        this.log("Player joined:", msg.playerId, msg.name || "");
         this.emit("join", joinedPlayer);
         break;
       case "leave":
         const leftPlayer = this._players.get(msg.playerId);
         this._players.delete(msg.playerId);
+        this.log("Player left:", msg.playerId);
         if (leftPlayer) this.emit("leave", leftPlayer);
         break;
       case "host_changed":
         this._hostId = msg.hostId;
+        this.log("Host changed to:", msg.hostId);
         break;
       case "message":
       case "broadcast":
@@ -139,6 +159,19 @@ var Room = class {
           tick: msg.tick || 0
         });
         break;
+      case "kicked":
+        if (msg.playerId === this.config.playerId) {
+          this._wasKicked = true;
+          this.log("You were kicked:", msg.reason || "No reason given");
+          this.emit("kicked", msg.reason);
+          this.ws?.close();
+        } else {
+          const kickedPlayer = this._players.get(msg.playerId);
+          this._players.delete(msg.playerId);
+          this.log("Player kicked:", msg.playerId, msg.reason || "");
+          if (kickedPlayer) this.emit("leave", kickedPlayer);
+        }
+        break;
       case "pong":
         break;
     }
@@ -150,6 +183,7 @@ var Room = class {
     }
     this.reconnectAttempts++;
     const delay = Math.min(1e3 * Math.pow(2, this.reconnectAttempts - 1), 3e4);
+    this.log("Reconnecting in", delay, "ms (attempt", this.reconnectAttempts, ")");
     this.reconnectTimeout = setTimeout(async () => {
       try {
         await this.connect();
@@ -160,16 +194,35 @@ var Room = class {
   // === MESSAGING ===
   /** Send data to all players in the room */
   broadcast(data) {
+    this.log("\u2192 broadcast", data);
     this.send_ws({ type: "broadcast", data });
   }
   /** Send data to a specific player */
   send(playerId, data) {
+    this.log("\u2192 direct to", playerId, data);
     this.send_ws({ type: "direct", to: playerId, data });
   }
   send_ws(data) {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
     }
+  }
+  // === HOST ACTIONS ===
+  /**
+   * Kick a player from the room (host only)
+   * @param playerId - Player ID to kick
+   * @param reason - Optional reason for the kick
+   */
+  kick(playerId, reason) {
+    if (!this.isHost) {
+      this.log("Cannot kick - not the host");
+      throw new Error("Only the host can kick players");
+    }
+    if (playerId === this.config.playerId) {
+      throw new Error("Cannot kick yourself");
+    }
+    this.log("\u2192 kick", playerId, reason || "");
+    this.send_ws({ type: "kick", playerId, reason });
   }
   // === EVENTS ===
   on(event, callback) {
@@ -189,58 +242,6 @@ var Room = class {
         console.error(`Error in ${event} handler:`, e);
       }
     });
-  }
-  // === PERSISTENCE ===
-  getSaveUrl(key) {
-    const base = `${this.config.apiUrl}/v1/connect/saves`;
-    const params = `?gameId=${encodeURIComponent(this.config.gameId)}&playerId=${encodeURIComponent(this.config.playerId)}`;
-    return key ? `${base}/${encodeURIComponent(key)}${params}` : `${base}${params}`;
-  }
-  /** Save data to cloud storage (per-player) */
-  async save(key, data) {
-    const response = await fetch(this.getSaveUrl(key), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data)
-    });
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      throw new Error(err.error || "Failed to save");
-    }
-  }
-  /** Load data from cloud storage (per-player) */
-  async load(key) {
-    const response = await fetch(this.getSaveUrl(key), {
-      method: "GET"
-    });
-    if (!response.ok) {
-      if (response.status === 404) return null;
-      const err = await response.json().catch(() => ({}));
-      throw new Error(err.error || "Failed to load");
-    }
-    return await response.json();
-  }
-  /** Delete saved data */
-  async deleteSave(key) {
-    const response = await fetch(this.getSaveUrl(key), {
-      method: "DELETE"
-    });
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      throw new Error(err.error || "Failed to delete");
-    }
-  }
-  /** List all saved keys */
-  async listSaves() {
-    const response = await fetch(this.getSaveUrl(), {
-      method: "GET"
-    });
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      throw new Error(err.error || "Failed to list saves");
-    }
-    const result = await response.json();
-    return result.keys;
   }
   // === ROOM INFO ===
   /** Room code for sharing */
@@ -271,6 +272,10 @@ var Room = class {
   get connected() {
     return this._connected;
   }
+  /** Recent events from the room (messages, joins, leaves) */
+  get history() {
+    return [...this._history];
+  }
   // === LIFECYCLE ===
   /** Leave the room and disconnect */
   leave() {
@@ -289,11 +294,17 @@ var Room = class {
     if (typeof localStorage !== "undefined") {
       const stored = localStorage.getItem("watchtower_player_id");
       if (stored) return stored;
-      const id = "p_" + Math.random().toString(36).substring(2, 11);
+      const id = "p_" + this.randomId();
       localStorage.setItem("watchtower_player_id", id);
       return id;
     }
-    return "p_" + Math.random().toString(36).substring(2, 11);
+    return "p_" + this.randomId();
+  }
+  randomId() {
+    if (typeof crypto !== "undefined" && crypto.randomUUID) {
+      return crypto.randomUUID().replace(/-/g, "").substring(0, 12);
+    }
+    return Math.random().toString(36).substring(2, 11);
   }
 };
 async function connect(roomId, options) {

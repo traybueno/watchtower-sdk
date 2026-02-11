@@ -141,7 +141,7 @@ export class Room {
       const params = new URLSearchParams({
         playerId: this.config.playerId,
         gameId: this.config.gameId,
-        ...(this.config.create ? { create: 'true' } : {}),
+        create: this.config.create ? 'true' : 'false',
         ...(this.config.name ? { name: this.config.name } : {}),
         ...(this.config.meta ? { meta: JSON.stringify(this.config.meta) } : {})
       })
@@ -428,11 +428,18 @@ export class Room {
     if (typeof localStorage !== 'undefined') {
       const stored = localStorage.getItem('watchtower_player_id')
       if (stored) return stored
-      const id = 'p_' + Math.random().toString(36).substring(2, 11)
+      const id = 'p_' + this.randomId()
       localStorage.setItem('watchtower_player_id', id)
       return id
     }
-    return 'p_' + Math.random().toString(36).substring(2, 11)
+    return 'p_' + this.randomId()
+  }
+
+  private randomId(): string {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+      return crypto.randomUUID().replace(/-/g, '').substring(0, 12)
+    }
+    return Math.random().toString(36).substring(2, 11)
   }
 }
 

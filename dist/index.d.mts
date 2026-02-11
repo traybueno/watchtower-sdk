@@ -22,9 +22,10 @@
  * console.log('Am I host?', room.isHost)
  * console.log('Share code:', room.code)
  *
- * // Persistence
- * await room.save('progress', { level: 5 })
- * const data = await room.load('progress')
+ * // Kick a player (host only)
+ * if (room.isHost) {
+ *   room.kick('player123', 'Breaking rules')
+ * }
  * ```
  */
 interface ConnectOptions {
@@ -40,6 +41,8 @@ interface ConnectOptions {
     name?: string;
     /** Player metadata (avatar, color, etc) */
     meta?: Record<string, unknown>;
+    /** Enable debug logging (default: false) */
+    debug?: boolean;
 }
 interface Player {
     id: string;
@@ -51,15 +54,24 @@ interface MessageMeta {
     serverTime: number;
     tick: number;
 }
+/** Event stored in history */
+interface HistoryEvent {
+    type: string;
+    serverTime: number;
+    tick: number;
+    [key: string]: unknown;
+}
 type MessageHandler = (from: string, data: unknown, meta: MessageMeta) => void;
 type PlayerHandler = (player: Player) => void;
 type VoidHandler = () => void;
+type KickedHandler = (reason?: string) => void;
 type EventMap = {
     message: MessageHandler;
     join: PlayerHandler;
     leave: PlayerHandler;
     connected: VoidHandler;
     disconnected: VoidHandler;
+    kicked: KickedHandler;
     error: (error: Error) => void;
 };
 declare class Room {
@@ -69,10 +81,13 @@ declare class Room {
     private _players;
     private _hostId;
     private _connected;
+    private _history;
+    private _wasKicked;
     private reconnectAttempts;
     private maxReconnectAttempts;
     private reconnectTimeout;
     constructor(roomId: string, config?: ConnectOptions);
+    private log;
     connect(): Promise<void>;
     private handleMessage;
     private attemptReconnect;
@@ -81,18 +96,15 @@ declare class Room {
     /** Send data to a specific player */
     send(playerId: string, data: unknown): void;
     private send_ws;
+    /**
+     * Kick a player from the room (host only)
+     * @param playerId - Player ID to kick
+     * @param reason - Optional reason for the kick
+     */
+    kick(playerId: string, reason?: string): void;
     on<K extends keyof EventMap>(event: K, callback: EventMap[K]): void;
     off<K extends keyof EventMap>(event: K, callback: EventMap[K]): void;
     private emit;
-    private getSaveUrl;
-    /** Save data to cloud storage (per-player) */
-    save(key: string, data: unknown): Promise<void>;
-    /** Load data from cloud storage (per-player) */
-    load<T = unknown>(key: string): Promise<T | null>;
-    /** Delete saved data */
-    deleteSave(key: string): Promise<void>;
-    /** List all saved keys */
-    listSaves(): Promise<string[]>;
     /** Room code for sharing */
     get code(): string;
     /** Your player ID */
@@ -107,9 +119,12 @@ declare class Room {
     get playerCount(): number;
     /** Is WebSocket connected? */
     get connected(): boolean;
+    /** Recent events from the room (messages, joins, leaves) */
+    get history(): HistoryEvent[];
     /** Leave the room and disconnect */
     leave(): void;
     private generatePlayerId;
+    private randomId;
 }
 /**
  * Connect to a room. Creates the room if it doesn't exist.
@@ -132,6 +147,9 @@ declare class Room {
  *   name: 'Player1',
  *   meta: { avatar: 'knight', color: '#ff0000' }
  * })
+ *
+ * // With debug logging
+ * const room = await connect('my-room', { debug: true })
  * ```
  */
 declare function connect(roomId?: string, options?: ConnectOptions): Promise<Room>;
@@ -140,4 +158,4 @@ declare const _default: {
     Room: typeof Room;
 };
 
-export { type ConnectOptions, type MessageHandler, type MessageMeta, type Player, type PlayerHandler, Room, type VoidHandler, connect, _default as default };
+export { type ConnectOptions, type HistoryEvent, type KickedHandler, type MessageHandler, type MessageMeta, type Player, type PlayerHandler, Room, type VoidHandler, connect, _default as default };
